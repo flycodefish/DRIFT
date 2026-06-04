@@ -29,3 +29,8 @@ build/
 *.pt
 *.pth
 *.ckpt
+
+
+EXPERIMENT_RESULTS.md
+figures/
+paper/
