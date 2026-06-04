@@ -1,0 +1,55 @@
+aggregation_strategy: hierarchical_weighted
+algorithm: de_asfl
+alpha: 10.0
+async_communication: true
+bandwidth: null
+bandwidth_mbps_range:
+- 50
+- 1000
+batch_size: 64
+cluster_max_child: 3
+cluster_max_retry: 3
+cluster_offset: 30.0
+cluster_request_timeout: 2.0
+cluster_trigger_factor: 0.05
+cosine_annealing: true
+cpu_cores_range:
+- 2
+- 16
+data_dir: ./data
+dataset: cifar10
+distribution_similarity_threshold: 0
+drop_rate: 0.0
+election_base_trigger_time: 10.0
+election_trigger_factor: 0.1
+enable_clustering: true
+enable_election: true
+experiment_name: de_asfl_cifar10_alpha10
+gpu_memory_gb_range:
+- 0
+- 32
+latency: null
+learning_rate: 0.001
+learning_rate_min: 1e-4
+local_epochs: 2
+log_interval: 1
+max_neighbors: 4
+memory_gb_range:
+- 4
+- 64
+min_neighbors: 3
+model: resnet18
+neighbor_selection: random
+num_classes: 10
+num_clients: 30
+num_gpus: 0.05
+output_dir: outputs
+partition: dirichlet
+rounds: 100
+save_model: true
+save_plots: true
+seed: 42
+topology_type: mesh
+use_gpu: true
+warmup_rounds: 5
+weight_decay: 0.0001

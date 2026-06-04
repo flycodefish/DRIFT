@@ -1,0 +1,58 @@
+# DE-ASFL mini test config (5 clients, 3 rounds, CNN model)
+experiment_name: deasfl_test
+output_dir: outputs
+seed: 42
+
+dataset: cifar10
+data_dir: ./data
+model: cnn
+num_classes: 10
+
+num_clients: 5
+rounds: 3
+local_epochs: 1
+batch_size: 16
+learning_rate: 0.001
+weight_decay: 0.0001
+learning_rate_min: 1e-4
+warmup_rounds: 1
+cosine_annealing: true
+
+partition: dirichlet
+alpha: 0.5
+
+algorithm: de_asfl
+aggregation_strategy: hierarchical_weighted
+
+topology_type: mesh
+neighbor_selection: random
+min_neighbors: 2
+max_neighbors: 3
+
+enable_election: true
+election_base_trigger_time: 5.0
+election_trigger_factor: 0.1
+cpu_cores_range: [2, 16]
+memory_gb_range: [4, 64]
+bandwidth_mbps_range: [50, 1000]
+gpu_memory_gb_range: [0, 32]
+
+enable_clustering: true
+cluster_max_child: 3
+cluster_max_retry: 3
+cluster_request_timeout: 2.0
+cluster_offset: 10.0
+cluster_trigger_factor: 0.05
+distribution_similarity_threshold: 0
+
+bandwidth: null
+latency: null
+drop_rate: 0.0
+async_communication: true
+
+use_gpu: false
+num_gpus: 0.0
+
+log_interval: 1
+save_model: false
+save_plots: false

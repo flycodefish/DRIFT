@@ -1,0 +1,49 @@
+# Gossip 工业场景验证 — HAR 人体活动识别数据集
+# 12客户端，80轮，MLP模型，Mesh拓扑，随机邻居
+
+# Algorithm settings
+algorithm: gossip
+program_name: gossip_har
+
+# Topology settings
+topology: mesh
+neighbor_strategy: random_per_round
+neighbor_k: 3
+
+# Training settings
+seed: 42
+num_clients: 12
+rounds: 80
+local_epochs: 2
+batch_size: 32
+learning_rate: 0.001
+learning_rate_min: 1e-4
+warmup_rounds: 5
+cosine_annealing: true
+client_sample_ratio: 1.0
+client_drop_rate: 0.0
+
+# Data settings
+dataset: har
+model: harmlp
+num_classes: 6
+input_dim: 561
+
+# Data partition settings
+data_partition_mode: dirichlet
+dirichlet_alpha: 0.1
+classes_per_client: 2
+
+# Network settings
+link_bandwidth_mbps: 100.0
+link_latency_ms: 5.0
+link_drop_rate: 0.0
+link_profile_mode: homogeneous
+
+# Client heterogeneity settings
+client_speed_mode: uniform
+client_network_mode: uniform
+client_storage_mode: uniform
+
+# Output settings
+output_dir: outputs

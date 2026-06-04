@@ -1,0 +1,58 @@
+# DE-ASFL 动态节点故障实验 — 高故障率 (10%)
+# 用于对比不同故障率下的鲁棒性
+# 继承自 config_de_asfl_dynamic_failure.yaml
+
+experiment_name: deasfl_dynamic_failure_high
+output_dir: outputs
+seed: 42
+dataset: cifar10
+data_dir: ./data
+model: resnet18
+num_classes: 10
+num_clients: 30
+rounds: 100
+local_epochs: 2
+batch_size: 64
+learning_rate: 0.001
+weight_decay: 0.0001
+learning_rate_min: 1e-4
+warmup_rounds: 5
+cosine_annealing: true
+partition: dirichlet
+alpha: 0.1
+algorithm: de_asfl
+aggregation_strategy: hierarchical_weighted
+topology_type: mesh
+neighbor_selection: random
+min_neighbors: 3
+max_neighbors: 4
+enable_election: true
+election_base_trigger_time: 10.0
+election_trigger_factor: 0.1
+cpu_cores_range: [2, 16]
+memory_gb_range: [4, 64]
+bandwidth_mbps_range: [50, 1000]
+gpu_memory_gb_range: [0, 32]
+enable_clustering: true
+cluster_max_child: 3
+cluster_max_retry: 3
+cluster_request_timeout: 2.0
+cluster_offset: 30.0
+cluster_trigger_factor: 0.05
+distribution_similarity_threshold: 0
+enable_dynamic_nodes: true
+failure_rate: 0.10                # 高故障率：每轮 10%
+failure_start_round: 20
+failure_max_nodes: 15
+failure_pattern: random
+node_join_enabled: false
+recovery_strategy: skip
+bandwidth: null
+latency: null
+drop_rate: 0.0
+async_communication: true
+use_gpu: true
+num_gpus: 0.05
+log_interval: 1
+save_model: true
+save_plots: true

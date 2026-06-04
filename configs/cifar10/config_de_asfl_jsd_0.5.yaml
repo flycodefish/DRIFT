@@ -1,0 +1,75 @@
+# NewFL 分层联邦学习配置文件
+# 基于 CIFAR-10 数据集，30客户端，星型拓扑，选举+聚类
+
+# ==================== 实验设置 ====================
+experiment_name: de_asfl分层联邦学习
+output_dir: outputs
+seed: 42
+
+# ==================== 数据集设置 ====================
+dataset: cifar10
+data_dir: ./data
+
+# ==================== 模型设置 ====================
+model: resnet18
+num_classes: 10
+
+# ==================== 训练设置 ====================
+num_clients: 30
+rounds: 100
+local_epochs: 2
+batch_size: 64
+learning_rate: 0.001
+weight_decay: 0.0001
+
+# ==================== 学习率调度设置 ====================
+learning_rate_min: 1e-4
+warmup_rounds: 5
+cosine_annealing: true
+
+# ==================== 数据划分设置 ====================
+partition: dirichlet
+alpha: 0.1
+
+# ==================== 算法设置 ====================
+algorithm: de_asfl
+aggregation_strategy: hierarchical_weighted
+
+# ==================== 拓扑设置 ====================
+topology_type: mesh
+neighbor_selection: random
+min_neighbors: 3
+max_neighbors: 4
+
+# ==================== 选举设置 ====================
+enable_election: true
+election_base_trigger_time: 10.0
+election_trigger_factor: 0.1
+cpu_cores_range: [2, 16]
+memory_gb_range: [4, 64]
+bandwidth_mbps_range: [50, 1000]
+gpu_memory_gb_range: [0, 32]
+
+# ==================== 聚类设置 ====================
+enable_clustering: true
+cluster_max_child: 3
+cluster_max_retry: 3
+cluster_request_timeout: 2.0
+cluster_offset: 30.0
+cluster_trigger_factor: 0.05
+distribution_similarity_threshold: 0.5  # JSD阈值，低于此值才接受聚合（0=完全相同，0.693=完全不同）
+
+# ==================== 通信设置 ====================
+bandwidth: null
+latency: null
+drop_rate: 0.0
+async_communication: true
+
+# ==================== 设备设置 ====================
+use_gpu: true
+num_gpus: 0.05
+
+# ==================== 日志设置 ====================
+log_interval: 1
+save_model: true
+save_plots: true

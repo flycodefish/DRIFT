@@ -1,0 +1,31 @@
+# ── Experiment outputs ─────────────────────────
+outputs/
+
+# ── Datasets (download separately, see README) ─
+data/
+
+# ── Python ────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# ── IDE / Editor ──────────────────────────────
+.vscode/
+.idea/
+
+# ── Claude config (local only) ────────────────
+.claude/
+
+# ── Misc ──────────────────────────────────────
+*.log
+*.tmp
+.DS_Store
+.ipynb_checkpoints/
+
+# ── Model checkpoints (large) ─────────────────
+*.pt
+*.pth
+*.ckpt

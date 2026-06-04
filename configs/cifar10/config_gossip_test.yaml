@@ -1,0 +1,38 @@
+# Gossip mini test config (5 clients, 3 rounds, CNN model)
+algorithm: gossip
+program_name: gossip_test
+topology: mesh
+neighbor_strategy: random_per_round
+neighbor_k: 2
+
+seed: 42
+num_clients: 5
+rounds: 3
+local_epochs: 1
+batch_size: 16
+learning_rate: 0.001
+learning_rate_min: 1e-4
+warmup_rounds: 1
+cosine_annealing: true
+client_sample_ratio: 1.0
+client_drop_rate: 0.0
+
+dataset: cifar10
+model: cnn
+num_classes: 10
+input_dim: 3072
+
+data_partition_mode: dirichlet
+dirichlet_alpha: 0.5
+classes_per_client: 2
+
+link_bandwidth_mbps: 100.0
+link_latency_ms: 5.0
+link_drop_rate: 0.0
+link_profile_mode: homogeneous
+
+client_speed_mode: uniform
+client_network_mode: uniform
+client_storage_mode: uniform
+
+output_dir: outputs

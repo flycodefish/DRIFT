@@ -1,0 +1,62 @@
+# DE-ASFL 工业场景验证 — HAR 人体活动识别数据集
+# 12客户端，80轮，MLP模型，Mesh拓扑
+
+# Experiment settings
+experiment_name: de_asfl_har
+output_dir: outputs
+seed: 42
+
+# Dataset settings
+dataset: har
+data_dir: ./data
+
+# Model settings
+model: harmlp
+num_classes: 6
+
+# Training settings
+num_clients: 12
+rounds: 80
+local_epochs: 2
+batch_size: 32
+learning_rate: 0.001
+weight_decay: 0.0001
+learning_rate_min: 0.0001
+warmup_rounds: 5
+cosine_annealing: true
+
+# Data partition settings
+partition: dirichlet
+alpha: 0.1
+
+# Algorithm settings
+algorithm: de_asfl
+aggregation_strategy: hierarchical_weighted
+
+# Topology settings
+topology_type: mesh
+neighbor_selection: random
+min_neighbors: 3
+max_neighbors: 4
+
+# Election settings
+enable_election: true
+election_base_trigger_time: 10.0
+election_trigger_factor: 0.1
+
+# Clustering settings
+enable_clustering: true
+cluster_max_child: 3
+cluster_max_retry: 3
+cluster_offset: 30.0
+cluster_trigger_factor: 0.05
+distribution_similarity_threshold: 0.2
+
+# Communication settings
+bandwidth: 100.0
+latency: 5.0
+drop_rate: 0.0
+
+# Device settings
+use_gpu: true
+num_gpus: 0.05

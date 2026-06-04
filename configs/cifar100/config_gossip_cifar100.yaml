@@ -1,0 +1,50 @@
+# Gossip baseline — CIFAR-100 可扩展性实验
+# 50客户端，150轮，ResNet-18，Mesh拓扑
+
+# Algorithm settings
+algorithm: gossip
+program_name: gossip_cifar100
+
+# Topology settings
+topology: mesh
+
+# Training settings
+seed: 42
+num_clients: 50
+rounds: 150
+local_epochs: 2
+batch_size: 16
+learning_rate: 0.001
+learning_rate_min: 0.0001
+warmup_rounds: 5
+cosine_annealing: true
+client_sample_ratio: 1.0
+client_drop_rate: 0.0
+
+# Gossip settings
+neighbor_strategy: random_per_round
+neighbor_k: 3
+
+# Data settings
+dataset: cifar100
+model: resnet18
+num_classes: 100
+input_dim: 3072
+
+# Data partition settings
+data_partition_mode: dirichlet
+dirichlet_alpha: 0.1
+
+# Network settings
+link_bandwidth_mbps: 100.0
+link_latency_ms: 5.0
+link_drop_rate: 0.0
+link_profile_mode: homogeneous
+
+# Client heterogeneity settings
+client_speed_mode: uniform
+client_network_mode: uniform
+client_storage_mode: uniform
+
+# Output settings
+output_dir: outputs
