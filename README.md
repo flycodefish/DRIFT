@@ -1,4 +1,4 @@
-# DE-ASFL: Decentralized Adaptive Stratified Federated Learning
+# DRIFT: Decentralized Routing-based Intelligent Federated Topology Learning in Dual Heterogeneous Edge Computing Networks
 
 A dual-aware routing framework for heterogeneous decentralized federated learning.
 
