@@ -176,6 +176,15 @@ def compute_model_bytes(params: Dict[str, torch.Tensor]) -> int:
     return total
 
 
+def weighted_validation_accuracy(eval_results: List[Dict]) -> float:
+    """按各节点验证样本数汇总准确率，等价于在合并验证集上评估。"""
+    total_samples = sum(result.get('num_samples', 0) for result in eval_results)
+    if total_samples == 0:
+        return float(np.mean([result['val_acc'] for result in eval_results]))
+    return sum(result['val_acc'] * result['num_samples']
+               for result in eval_results) / total_samples
+
+
 def hierarchical_aggregate(models: List[nn.Module], tree_mapping: Dict[int, Dict],
                            cluster_heads: List[int], device: torch.device,
                            comm: Optional['CommStats'] = None,
@@ -343,11 +352,11 @@ def distribute_models_to_cluster(aggregated_models: Dict[int, Dict],
         for child_id in sorted(tree_mapping[node_id]['children']):
             child_cluster_id = tree_mapping[child_id]['cluster_id']
             if child_cluster_id == tree_mapping[node_id]['cluster_id']:
-                if child_id in aggregated_models:
-                    # 统计：父节点→子节点的一次模型分发
-                    if comm is not None:
-                        comm.intra_cluster_dist_msgs += 1
-                    distribute_recursive(child_id, aggregated_models[child_id])
+                # 最终全局模型沿树广播给每个节点。原实现错误地重新加载
+                # 子节点的旧子树模型，使普通节点没有收到全局模型。
+                if comm is not None:
+                    comm.intra_cluster_dist_msgs += 1
+                distribute_recursive(child_id, model_state_dict)
 
     for cluster_head in cluster_heads:
         if cluster_head in aggregated_models:
@@ -603,7 +612,8 @@ class NewFLRuntime:
         random.seed(self.config.seed)
         np.random.seed(self.config.seed)
         torch.manual_seed(self.config.seed)
-        ray.init(ignore_reinit_error=True, logging_level="ERROR")
+        if getattr(self.config, 'use_ray_actors', True):
+            ray.init(ignore_reinit_error=True, logging_level="ERROR")
         print(f"NewFL Runtime started with seed: {self.config.seed}")
 
     def shutdown(self):
@@ -893,6 +903,14 @@ class NewFLRuntime:
         self.clustering_results = clustering_results
         self.tree_mapping = build_client_tree_mapping(clustering_results, self.config.num_clients)
 
+        # 分层权重必须代表真实样本数；只按节点数量会破坏与 FedAvg 的等价性。
+        if hasattr(self, 'client_sample_counts'):
+            set_tree_sample_counts(
+                self.tree_mapping,
+                self.client_sample_counts,
+                clustering_results.get('cluster_heads', []),
+            )
+
         if election_results is not None:
             self.election_results = election_results
 
@@ -917,7 +935,8 @@ class NewFLRuntime:
         if not TORCH_AVAILABLE:
             raise ImportError("PyTorch is not available. Cannot initialize training.")
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        use_cuda = self.config.use_gpu and torch.cuda.is_available()
+        self.device = torch.device("cuda" if use_cuda else "cpu")
         print(f"Training device: {self.device}")
 
         self.models = []
@@ -926,11 +945,17 @@ class NewFLRuntime:
         self.train_loaders = []
         self.val_loaders = []
 
+        base_model = (CNNModel(num_classes=num_classes) if use_cnn
+                      else SimpleModel(input_dim=input_dim, num_classes=num_classes))
+        base_state = {key: value.detach().clone()
+                      for key, value in base_model.state_dict().items()}
+
         for client_id in range(self.config.num_clients):
             if use_cnn:
                 model = CNNModel(num_classes=num_classes).to(self.device)
             else:
                 model = SimpleModel(input_dim=input_dim, num_classes=num_classes).to(self.device)
+            model.load_state_dict(base_state)
 
             self.models.append(model)
 
@@ -947,7 +972,13 @@ class NewFLRuntime:
             train_dataset = TensorDataset(train_data[client_id]['images'], train_data[client_id]['labels'])
             val_dataset = TensorDataset(val_data[client_id]['images'], val_data[client_id]['labels'])
 
-            self.train_loaders.append(DataLoader(train_dataset, batch_size=self.config.batch_size, shuffle=True))
+            generator = torch.Generator().manual_seed(self.config.seed + client_id)
+            self.train_loaders.append(DataLoader(
+                train_dataset,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                generator=generator,
+            ))
             self.val_loaders.append(DataLoader(val_dataset, batch_size=self.config.batch_size, shuffle=False))
 
         if global_test_data is not None:
@@ -1002,6 +1033,9 @@ class NewFLRuntime:
         base_state = {k: v.cpu().clone() for k, v in base_model.state_dict().items()}
 
         self.client_actors = [None] * self.config.num_clients
+        actor_gpu = (self.config.num_gpus
+                     if self.config.use_gpu and torch.cuda.is_available()
+                     else 0.0)
         for client_id in range(self.config.num_clients):
             if client_id not in self.active_nodes:
                 continue
@@ -1018,7 +1052,7 @@ class NewFLRuntime:
             neighbors = list(self.topology[client_id]) if self.topology else []
 
             use_img_xf = self.config.dataset not in ('har',)
-            actor = NewClientActor.remote(
+            actor = NewClientActor.options(num_gpus=actor_gpu).remote(
                 client_id=client_id,
                 model=model,
                 train_dataset=train_ds,
@@ -1028,7 +1062,8 @@ class NewFLRuntime:
                 weight_decay=self.config.weight_decay,
                 device=None,
                 neighbors=neighbors,
-                use_image_transform=use_img_xf
+                use_image_transform=use_img_xf,
+                seed=self.config.seed + client_id,
             )
             actor.set_local_epochs.remote(self.config.local_epochs)
             self.client_actors[client_id] = actor
@@ -1057,7 +1092,12 @@ class NewFLRuntime:
             训练损失
         """
         model = self.models[client_id]
-        optimizer = self.optimizers[client_id]
+        # 与 Ray/FedAvg 路径一致：每个联邦轮次重建本地 Adam 状态。
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=self._calc_learning_rate(round_id),
+            weight_decay=self.config.weight_decay,
+        )
         criterion = self.criterions[client_id]
         train_loader = self.train_loaders[client_id]
         
@@ -1895,11 +1935,16 @@ class NewFLRuntime:
                     all_node_accs = [r['val_acc'] for r in eval_results]
                 else:
                     all_node_accs = []
+                    eval_results = []
                     for client_id in range(self.config.num_clients):
                         _, val_acc = self._evaluate_single_client(client_id)
                         all_node_accs.append(val_acc)
+                        eval_results.append({
+                            'val_acc': val_acc,
+                            'num_samples': len(self.val_loaders[client_id].dataset),
+                        })
 
-                avg_all_node_acc = np.mean(all_node_accs)
+                avg_all_node_acc = weighted_validation_accuracy(eval_results)
                 results['global_accuracies'].append(avg_all_node_acc)
                 print(f"  所有节点平均准确率: {avg_all_node_acc:.4f}")
 
@@ -1935,8 +1980,7 @@ class NewFLRuntime:
 
                 print("\n[阶段4] 计算所有存活节点在本地验证集上的平均准确率")
                 eval_results = ray.get([a.evaluate.remote() for a in live_actors])
-                all_node_accs = [r['val_acc'] for r in eval_results]
-                avg_all_node_acc = np.mean(all_node_accs)
+                avg_all_node_acc = weighted_validation_accuracy(eval_results)
                 results['global_accuracies'].append(avg_all_node_acc)
                 print(f"  存活节点平均准确率: {avg_all_node_acc:.4f}")
 

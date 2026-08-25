@@ -30,7 +30,7 @@ DE-ASFL addresses the dual heterogeneity challenge (device + data) in decentrali
 
 ```bash
 conda env create -f environment.yml
-conda activate fl_env
+conda activate de-asfl
 ```
 
 ## Datasets
@@ -56,6 +56,30 @@ python scripts/run_fl.py --config configs/cifar10/config_gossip.yaml
 # DTD baseline
 python scripts/run_fl.py --config configs/cifar10/config_dtd_cifar10_alpha01.yaml
 ```
+
+### Local CPU run
+
+The original DRIFT aggregation remains hierarchical sample-weighted averaging;
+no personalized or tree-fine-tuning mechanism is included. For a small local
+CPU check with an existing CIFAR-10 download:
+
+```bash
+python scripts/test_30_clients.py \
+  --config configs/cifar10/config_de_asfl_test.yaml \
+  --data-dir /path/to/data --rounds 1 --serial
+```
+
+Verify the theorem implemented by the baseline—that hierarchical aggregation
+is numerically equivalent to sample-weighted FedAvg—using identical trained
+client checkpoints:
+
+```bash
+python scripts/verify_fedavg_equivalence.py --data-dir /path/to/data
+python -m unittest discover -s tests -v
+```
+
+The verifier fails if the maximum parameter difference exceeds `1e-6` or if
+the two aggregated models produce different test accuracy.
 
 ## Citation
 

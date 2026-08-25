@@ -208,26 +208,18 @@ def load_cifar10_data(data_dir='./data', num_clients=30, partition_mode='dirichl
     trainset = torchvision.datasets.CIFAR10(root=data_dir, train=True, download=False, transform=None)
     testset = torchvision.datasets.CIFAR10(root=data_dir, train=False, download=False, transform=None)
 
-    all_data = np.concatenate([trainset.data, testset.data], axis=0)
-    all_labels = np.concatenate([np.array(trainset.targets), np.array(testset.targets)], axis=0)
-
-    all_data = torch.tensor(all_data).permute(0, 3, 1, 2).float() / 255.0
+    # 官方训练集只用于本地训练；官方测试集只用于验证和全局评估。
+    # 不能先合并再随机切分，否则会把测试样本泄漏到本地训练中。
+    train_x = torch.tensor(trainset.data).permute(0, 3, 1, 2).float() / 255.0
+    train_y = torch.tensor(trainset.targets)
+    val_x = torch.tensor(testset.data).permute(0, 3, 1, 2).float() / 255.0
+    val_y = torch.tensor(testset.targets)
     mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
     std = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
-    all_data = (all_data - mean) / std
-    all_labels = torch.tensor(all_labels)
+    train_x = (train_x - mean) / std
+    val_x = (val_x - mean) / std
 
-    split = int(0.8 * len(all_data))
-    indices = torch.randperm(len(all_data))
-    train_indices = indices[:split]
-    val_indices = indices[split:]
-
-    train_x = all_data[train_indices]
-    train_y = all_labels[train_indices]
-    val_x = all_data[val_indices]
-    val_y = all_labels[val_indices]
-
-    global_test_data = None
+    global_test_data = {'images': val_x, 'labels': val_y}
 
     if partition_mode == 'iid':
         train_data, val_data, indices = _build_iid_shards_simple(train_x, train_y, val_x, val_y, num_clients)

@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader, Subset
 from typing import List, Dict, Optional
 import torchvision.transforms as T
 
-@ray.remote(num_cpus=0.05, max_concurrency=4, num_gpus=0.066)
+@ray.remote(num_cpus=0.05, max_concurrency=4)
 class NewClientActor:
     """
     联邦学习客户端Actor类
@@ -50,9 +50,10 @@ class NewClientActor:
     def __init__(self, client_id: int, model, train_dataset, val_dataset,
                  batch_size: int, lr: float, weight_decay: float,
                  device=None, neighbors: Optional[List[int]] = None,
-                 use_image_transform: bool = True):
+                 use_image_transform: bool = True, seed: int = 0):
         # 客户端基本信息
         self.client_id = client_id
+        self.seed = seed
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -72,10 +73,12 @@ class NewClientActor:
         
         # 创建数据加载器
         # DataLoader负责将数据集分成批次，支持多线程加载
+        loader_generator = torch.Generator().manual_seed(seed)
         self.train_loader = DataLoader(
             train_dataset, 
             batch_size=batch_size, 
-            shuffle=True  # 训练时打乱数据顺序
+            shuffle=True,
+            generator=loader_generator,
         )
         self.val_loader = DataLoader(
             val_dataset, 
@@ -165,6 +168,7 @@ class NewClientActor:
         4. 返回训练统计信息
         """
         self._ensure_cuda()
+        torch.manual_seed(self.seed + round_id)
         # 每轮重建优化器（对齐 FedAvg/Gossip）
         optimizer = torch.optim.Adam(
             self.model.parameters(),
@@ -255,7 +259,8 @@ class NewClientActor:
         return {
             'client_id': self.client_id,
             'val_loss': avg_loss,
-            'val_acc': accuracy
+            'val_acc': accuracy,
+            'num_samples': total,
         }
     
     def clear_cache(self):

@@ -101,6 +101,7 @@ def parse_args() -> FLConfig:
     
     # Output parameters
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--data-dir", type=str, default=None)
     
     args = parser.parse_args()
     
@@ -139,6 +140,7 @@ def parse_args() -> FLConfig:
     set_param("--dirichlet-alpha", args.dirichlet_alpha, "dirichlet_alpha")
     set_param("--model", args.model)
     set_param("--output-dir", args.output_dir, "output_dir")
+    set_param("--data-dir", args.data_dir, "data_dir")
     
     # 根据算法自动设置拓扑
     algorithm = config_dict.get("algorithm", "fedavg")

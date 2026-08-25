@@ -58,6 +58,7 @@ class RayFLRuntime:
 
     def start(self) -> None:
         random.seed(self.cfg.seed)
+        np.random.seed(self.cfg.seed)
         torch.manual_seed(self.cfg.seed)
         ray.init(
             ignore_reinit_error=True,
@@ -236,46 +237,23 @@ class RayFLRuntime:
         raise ValueError(f"Unsupported data_partition_mode: {self.cfg.data_partition_mode}")
 
     def _build_cifar10_data(self) -> None:
-        """Load and partition CIFAR-10 dataset."""
-        import torchvision
-        import torchvision.transforms as transforms
-        
-        # 加载原始数据（transform 仅用于 download，实际归一化手动完成）
-        trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=None)
-        testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=None)
+        """Load CIFAR-10 through the partitioner shared with DRIFT."""
+        from fl_core.data_loader import load_cifar10_data
 
-        # 合并数据集并分割为训练和验证集
-        all_data = np.concatenate([trainset.data, testset.data], axis=0)
-        all_labels = np.concatenate([np.array(trainset.targets), np.array(testset.targets)], axis=0)
-
-        # 转换数据格式并做 ImageNet 归一化（对齐 DE-ASFL）
-        all_data = torch.tensor(all_data).permute(0, 3, 1, 2).float() / 255.0
-        mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
-        std = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
-        all_data = (all_data - mean) / std
-        all_labels = torch.tensor(all_labels)
-        
-        # 分割为训练和验证集
-        split = int(0.8 * len(all_data))
-        train_x, train_y = all_data[:split], all_labels[:split]
-        self.val_x, self.val_y = all_data[split:], all_labels[split:]
-        
-        self.train_shards = []
-        self.client_label_stats = []
-        
-        if self.cfg.data_partition_mode == "iid":
-            self._build_iid_shards(train_x, train_y)
-            return
-
-        if self.cfg.data_partition_mode == "label_skew":
-            self._build_label_skew_shards(train_x, train_y)
-            return
-
-        if self.cfg.data_partition_mode == "dirichlet":
-            self._build_dirichlet_shards(train_x, train_y)
-            return
-
-        raise ValueError(f"Unsupported data_partition_mode: {self.cfg.data_partition_mode}")
+        train_data, val_data, _, _, _ = load_cifar10_data(
+            data_dir=self.cfg.data_dir,
+            num_clients=self.cfg.num_clients,
+            partition_mode=self.cfg.data_partition_mode,
+            alpha=self.cfg.dirichlet_alpha,
+        )
+        self.train_shards = [
+            (item['images'], item['labels']) for item in train_data
+        ]
+        self.client_label_stats = [
+            self._count_labels(item['labels']) for item in train_data
+        ]
+        self.val_x = torch.cat([item['images'] for item in val_data], dim=0)
+        self.val_y = torch.cat([item['labels'] for item in val_data], dim=0)
 
     def _build_cifar100_data(self) -> None:
         """Load and partition CIFAR-100 dataset."""
@@ -503,8 +481,11 @@ class RayFLRuntime:
         # 使用顺序for循环而非列表推导，错开Actor创建时机
         # 结合 lazy CUDA init，避免50个Actor同时初始化CUDA导致cuBLAS handle耗尽
         self.clients = []
+        actor_gpu = (self.cfg.num_gpus
+                     if self.cfg.use_gpu and torch.cuda.is_available()
+                     else 0.0)
         for client_id, (shard_x, shard_y) in enumerate(self.train_shards):
-            actor = ClientActor.remote(
+            actor = ClientActor.options(num_gpus=actor_gpu).remote(
                 client_id=client_id,
                 features=shard_x,
                 labels=shard_y,
@@ -516,6 +497,7 @@ class RayFLRuntime:
                 step_delay_ms=self.client_step_delays_ms[client_id],
                 dataset=dataset,
                 model=model,
+                seed=self.cfg.seed + client_id,
             )
             self.clients.append(actor)
 
@@ -775,7 +757,7 @@ class RayFLRuntime:
             # Warmup 阶段
             if round_id < warmup_rounds:
                 # 线性增长：lr = initial_lr * (round_id / warmup_rounds)
-                new_lr = initial_lr * (round_id / warmup_rounds)
+                new_lr = initial_lr * ((round_id + 1) / max(1, warmup_rounds))
             else:
                 # Cosine Annealing 阶段
                 # 从 warmup_rounds 开始的进度：[0, max_rounds - warmup_rounds]

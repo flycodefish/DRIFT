@@ -60,4 +60,7 @@ class FLConfig:
     jsd_temperature: float = 1.0  # DTD JSD temperature for mixing weights
     output_dir: str = "outputs"
     dataset: str = "synthetic"  # synthetic | cifar10
+    data_dir: str = "./data"
     model: str = "cnn"  # cnn | resnet18
+    use_gpu: bool = True
+    num_gpus: float = 0.066

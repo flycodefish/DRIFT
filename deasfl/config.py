@@ -66,7 +66,7 @@ class NewFLConfig:
     
     # ==================== 算法设置 ====================
     algorithm: str = "custom"              # 算法类型
-    aggregation_strategy: str = "custom"   # 聚合策略：custom, avg, weighted_avg
+    aggregation_strategy: str = "hierarchical_weighted"  # 原始分层样本加权平均
     
     # ==================== 拓扑设置（去中心化） ====================
     topology_type: str = "mesh"            # 拓扑类型：mesh, ring, star, fully_connected
@@ -116,6 +116,7 @@ class NewFLConfig:
     # ==================== 设备设置 ====================
     use_gpu: bool = True   # 是否使用GPU
     num_gpus: float = 0.05 # 每个客户端分配的GPU资源比例
+    use_ray_actors: bool = True  # False 时使用单进程顺序模拟
     
     # ==================== 日志设置 ====================
     log_interval: int = 1      # 日志打印间隔（轮数）

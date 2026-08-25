@@ -243,7 +243,7 @@ def validate_hierarchical_structure(clustering_result, max_child):
     }
 
 
-def test_30_clients(config_path: str = None):
+def test_30_clients(config_path: str = None, config_overrides: dict = None):
     """测试联邦学习训练功能
     
     Args:
@@ -260,6 +260,10 @@ def test_30_clients(config_path: str = None):
         else:
             cfg = NewFLConfig()
             print(f"\n使用默认配置")
+
+        for key, value in (config_overrides or {}).items():
+            if value is not None:
+                setattr(cfg, key, value)
 
         print(f"\n{'='*60}")
         print("配置信息:")
@@ -401,9 +405,18 @@ def test_30_clients(config_path: str = None):
         print("步骤3：运行训练")
         print("=" * 80)
 
-        # 创建 Ray Actor 客户端（启用分布式并行训练）
-        print("创建 Ray 并行训练客户端...")
-        runtime._init_ray_actors(train_data, val_data)
+        if cfg.use_ray_actors:
+            print("创建 Ray 并行训练客户端...")
+            runtime._init_ray_actors(train_data, val_data)
+        else:
+            print("创建单进程顺序训练客户端...")
+            runtime.init_training(
+                train_data,
+                val_data,
+                use_cnn=cfg.model in ('cnn', 'cnnmodel'),
+                num_classes=cfg.num_classes,
+                global_test_data=global_test_data,
+            )
 
         # 运行训练
         training_results = runtime.run_training(num_rounds=cfg.rounds)
@@ -468,7 +481,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='联邦学习训练')
     parser.add_argument('--config', type=str, default=None,
                        help='YAML配置文件路径，默认使用config_de_asfl.yaml')
+    parser.add_argument('--seed', type=int, default=None, help='覆盖随机种子')
+    parser.add_argument('--rounds', type=int, default=None, help='覆盖训练轮数')
+    parser.add_argument('--data-dir', type=str, default=None, help='覆盖数据集目录')
+    parser.add_argument('--serial', action='store_true', help='使用单进程CPU顺序模拟')
     args = parser.parse_args()
     
     config_path = args.config if args.config else 'config_de_asfl.yaml'
-    test_30_clients(config_path=config_path)
+    test_30_clients(
+        config_path=config_path,
+        config_overrides={
+            'seed': args.seed,
+            'rounds': args.rounds,
+            'data_dir': args.data_dir,
+            'use_ray_actors': False if args.serial else None,
+            'use_gpu': False if args.serial else None,
+        },
+    )

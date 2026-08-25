@@ -36,27 +36,25 @@ class CNN(nn.Module):
     """CNN model for CIFAR-10 dataset."""
     def __init__(self, num_classes: int) -> None:
         super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-        self.classifier = nn.Sequential(
-            nn.Linear(128 * 4 * 4, 256),
-            nn.ReLU(),
-            nn.Linear(256, num_classes),
-        )
+        # 与 DRIFT 的 CNNModel 保持完全相同，确保比较只改变聚合路径。
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.fc1 = nn.Linear(128 * 4 * 4, 256)
+        self.fc2 = nn.Linear(256, num_classes)
+        self.dropout = nn.Dropout(0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
+        x = self.pool(torch.relu(self.bn1(self.conv1(x))))
+        x = self.pool(torch.relu(self.bn2(self.conv2(x))))
+        x = self.pool(torch.relu(self.bn3(self.conv3(x))))
         x = x.view(x.size(0), -1)
-        x = self.classifier(x)
+        x = self.dropout(torch.relu(self.fc1(x)))
+        x = self.fc2(x)
         return x
 
 
@@ -115,7 +113,7 @@ def estimate_state_dict_bytes(params: dict[str, torch.Tensor]) -> int:
     return total
 
 
-@ray.remote(num_cpus=0.05, max_concurrency=1, num_gpus=0.066)
+@ray.remote(num_cpus=0.05, max_concurrency=1)
 class ClientActor:
     """Low-level client actor: training/evaluation/model upload APIs."""
 
@@ -132,8 +130,10 @@ class ClientActor:
         step_delay_ms: float,
         dataset: str = 'synthetic',
         model: str = 'cnn',
+        seed: int = 0,
     ) -> None:
         self.client_id = client_id
+        self.seed = seed
         
         # 根据数据集类型和模型选择参数选择模型
         if dataset in ('cifar10', 'neu', 'cifar100'):
@@ -152,7 +152,13 @@ class ClientActor:
         self._model_on_gpu = False
         # 数据保留在CPU，训练时按batch搬上GPU，避免显存OOM
         self.dataset = TensorDataset(features, labels)
-        self.loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
+        loader_generator = torch.Generator().manual_seed(seed)
+        self.loader = DataLoader(
+            self.dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            generator=loader_generator,
+        )
         self.learning_rate = learning_rate
         self.current_lr = learning_rate  # 保存当前学习率，用于动态调整
         self.local_epochs = local_epochs
@@ -206,6 +212,7 @@ class ClientActor:
 
     def local_train(self, round_id: int):
         self._ensure_cuda()
+        torch.manual_seed(self.seed + round_id)
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(
             self.model.parameters(), lr=self.current_lr, weight_decay=1e-4
