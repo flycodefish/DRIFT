@@ -1,5 +1,8 @@
 # ── Experiment outputs ─────────────────────────
 outputs/
+results/locality_placement_diagnostic/
+results/sequential_cluster_diagnostic/
+results/parent_child_chain_diagnostic/
 
 # ── Datasets (download separately, see README) ─
 data/

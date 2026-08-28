@@ -63,6 +63,15 @@ class NewFLConfig:
     # ==================== 数据划分设置 ====================
     partition: str = "dirichlet"  # 数据划分策略：dirichlet, random 等
     alpha: float = 0.1            # Dirichlet分布参数，越小异构性越强
+
+    # ==================== 数据放置设置（distribution -> node 映射） ====================
+    # 只改变“随机生成的 client distribution 放到哪个 topology node”，不改 Dirichlet 划分本身。
+    # random   = seed 控制的随机 permutation（control，默认，保持现有行为）
+    # locality = seed 控制的随机两两交换优化，降低 topology edge 上的 JSD（软统计偏置）
+    data_placement_mode: str = "random"
+    locality_placement_steps: int = 2000   # locality 优化的固定最大步数（有限预算，不无限收敛）
+    locality_temperature: float = 0.05      # 交换接受温度（允许小概率接受非改善 swap 跳出局部最优）
+    locality_seed: Optional[int] = None     # 默认继承 experiment seed
     
     # ==================== 算法设置 ====================
     algorithm: str = "custom"              # 算法类型
