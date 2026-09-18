@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import time
 import warnings
 
@@ -32,55 +33,8 @@ class MLP(nn.Module):
         return self.layers(x)
 
 
-class CNN(nn.Module):
-    """CNN model for CIFAR-10 dataset."""
-    def __init__(self, num_classes: int) -> None:
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-        self.classifier = nn.Sequential(
-            nn.Linear(128 * 4 * 4, 256),
-            nn.ReLU(),
-            nn.Linear(256, num_classes),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
-        x = x.view(x.size(0), -1)
-        x = self.classifier(x)
-        return x
-
-
-class HARMLP(nn.Module):
-    """MLP for HAR human activity recognition (561-dim → 6 classes)."""
-    def __init__(self, input_dim: int = 561, num_classes: int = 6) -> None:
-        super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Linear(64, num_classes),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layers(x)
+from .data_loader import CNNModel as CNN
+from .data_loader import HARMLP, MergeSingletonBatchSampler
 
 
 class ResNet18(nn.Module):
@@ -115,6 +69,18 @@ def estimate_state_dict_bytes(params: dict[str, torch.Tensor]) -> int:
     return total
 
 
+def _apply_deterministic_settings(enabled: bool) -> None:
+    """Apply the same deterministic backend policy in every Ray worker."""
+    if not enabled:
+        return
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+
 @ray.remote(num_cpus=0.05, max_concurrency=1, num_gpus=0.066)
 class ClientActor:
     """Low-level client actor: training/evaluation/model upload APIs."""
@@ -132,8 +98,14 @@ class ClientActor:
         step_delay_ms: float,
         dataset: str = 'synthetic',
         model: str = 'cnn',
+        seed: int = 42,
+        deterministic_training: bool = True,
+        weight_decay: float = 1e-4,
+        merge_singleton_batch: bool = False,
     ) -> None:
+        _apply_deterministic_settings(deterministic_training)
         self.client_id = client_id
+        self.seed = seed
         
         # 根据数据集类型和模型选择参数选择模型
         if dataset in ('cifar10', 'neu', 'cifar100'):
@@ -152,11 +124,24 @@ class ClientActor:
         self._model_on_gpu = False
         # 数据保留在CPU，训练时按batch搬上GPU，避免显存OOM
         self.dataset = TensorDataset(features, labels)
-        self.loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
+        loader_generator = torch.Generator().manual_seed(seed)
+        if merge_singleton_batch:
+            self.loader = DataLoader(
+                self.dataset,
+                batch_sampler=MergeSingletonBatchSampler(
+                    self.dataset, batch_size, generator=loader_generator
+                ),
+            )
+        else:
+            self.loader = DataLoader(
+                self.dataset, batch_size=batch_size, shuffle=True,
+                generator=loader_generator,
+            )
         self.learning_rate = learning_rate
         self.current_lr = learning_rate  # 保存当前学习率，用于动态调整
         self.local_epochs = local_epochs
         self.step_delay_ms = step_delay_ms
+        self.weight_decay = weight_decay
 
         # FedProx: proximal term
         self.proximal_mu = 0.0
@@ -176,6 +161,13 @@ class ClientActor:
         if not self._model_on_gpu and self.device.type == 'cuda':
             self.model = self.model.to(self.device)
             self._model_on_gpu = True
+
+    def _offload_from_cuda(self):
+        """Return the persistent model to CPU after one bounded GPU task."""
+        if self._model_on_gpu:
+            self.model = self.model.cpu()
+            self._model_on_gpu = False
+            torch.cuda.empty_cache()
 
     def _warmup_cuda(self):
         """预热CUDA：移动模型到GPU并执行dummy前向/反向传播以初始化cuBLAS句柄"""
@@ -206,14 +198,19 @@ class ClientActor:
 
     def local_train(self, round_id: int):
         self._ensure_cuda()
+        torch.manual_seed(self.seed + round_id)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.seed + round_id)
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(
-            self.model.parameters(), lr=self.current_lr, weight_decay=1e-4
+            self.model.parameters(), lr=self.current_lr,
+            weight_decay=self.weight_decay,
         )
 
         self.model.train()
         start_time = time.perf_counter()
         running_loss = 0.0
+        trained_samples = 0
         for _ in range(self.local_epochs):
             for xb, yb in self.loader:
                 xb, yb = xb.to(self.device), yb.to(self.device)
@@ -230,7 +227,8 @@ class ClientActor:
                     loss = loss + (self.proximal_mu / 2.0) * prox
                 loss.backward()
                 optimizer.step()
-                running_loss += loss.item()
+                running_loss += loss.item() * xb.size(0)
+                trained_samples += xb.size(0)
                 
                 # [新增] 立即销毁计算图引用，释放显存
                 del output, loss
@@ -240,12 +238,11 @@ class ClientActor:
 
         # 训练结束后，显式清理梯度缓冲区
         optimizer.zero_grad(set_to_none=True)
+        del optimizer
+        self._offload_from_cuda()
         
         # 返回前清理缓存
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        avg_loss = running_loss / max(1, self.local_epochs * len(self.loader))
+        avg_loss = running_loss / max(1, trained_samples)
         return {
             "client_id": self.client_id,
             "train_loss": avg_loss,
@@ -271,10 +268,12 @@ class ClientActor:
         with torch.no_grad():
             for xb, yb in loader:
                 logits = self.model(xb)
-                loss_sum += criterion(logits, yb).item()
+                loss_sum += criterion(logits, yb).item() * yb.size(0)
                 correct += (logits.argmax(dim=1) == yb).sum().item()
                 total += yb.numel()
-        return loss_sum / max(1, len(loader)), correct / max(1, total)
+        result = (loss_sum / max(1, total), correct / max(1, total))
+        self._offload_from_cuda()
+        return result
 
     def upload_model(self):
         params = get_model_params(self.model)
@@ -337,6 +336,30 @@ class ClientActor:
                 merged[key] += params[key].float()
             merged[key] /= len(all_params)
 
+        set_model_params(self.model, merged)
+        return self.client_id
+
+    def receive_weighted_push(
+        self,
+        sender_params_list: list[dict[str, torch.Tensor]],
+        sender_ids: list[int],
+        weights: list[float],
+    ):
+        """Apply one synchronous Metropolis-style D-PSGD mixing step."""
+        current = get_model_params(self.model)
+        all_params = [current] + list(sender_params_list)
+        all_weights = [float(weights[0])] + [float(value) for value in weights[1:]]
+        if len(all_params) != len(all_weights) or not all_params:
+            raise ValueError("weighted push parameters and weights must align")
+        total = sum(all_weights)
+        if total <= 0:
+            raise ValueError("weighted push must have positive total weight")
+        merged = copy.deepcopy(current)
+        for key in merged:
+            value = torch.zeros_like(merged[key], dtype=torch.float32)
+            for weight, params in zip(all_weights, all_params):
+                value += params[key].float() * (weight / total)
+            merged[key] = value.to(merged[key].dtype)
         set_model_params(self.model, merged)
         return self.client_id
 

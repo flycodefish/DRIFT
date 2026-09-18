@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "status": "frozen",
+  "simulation_model_version": "simulation_time_v1",
+  "frozen_date": "2026-09-10",
+  "calibration_artifacts": [
+    "outputs/calibration/harmlp_gpu_v1_i/benchmark.json",
+    "outputs/calibration/harmlp_gpu_v1_j/benchmark.json"
+  ],
+  "calibration_sha256": [
+    "afe345896f8c5c303dcd61e19943b5967420b0b5c79f29e2fc08a22534a9e00d",
+    "0efb69258636da6a0179687db2eca291e6ecffc75b7f6efa6bc5d2dddd9eb829"
+  ],
+  "reference_model": "harmlp",
+  "reference_input_dim": 561,
+  "reference_num_classes": 6,
+  "reference_batch_size": 32,
+  "reference_device": "NVIDIA GeForce RTX 4090",
+  "reference_train_ms_per_sample_epoch": 0.043699180241674185,
+  "aggregation_fixed_ms": 0.0,
+  "aggregation_ms_per_model_mb": 1.5600196224165956,
+  "aggregation_fit_rmse_ms": 1.3075017891258867,
+  "default_bandwidth_mbps": 100.0,
+  "default_link_latency_ms": 5.0,
+  "default_compute_capacity": 1.0,
+  "default_aggregation_capacity": 1.0,
+  "resource_compute_capacity_reference": 16.0,
+  "compute_capacity_by_node": {"server": 1.0},
+  "aggregation_capacity_by_node": {"server": 1.0},
+  "network_capacity_by_node": {"server": 1000.0},
+  "server_compute_capacity": 1.0,
+  "server_network_capacity_mbps": 1000.0,
+  "link_concurrency": "directed_link_fifo",
+  "duplex": "full_duplex",
+  "node_transfer_contention": "separate_tx_rx_fifo",
+  "scheduler": "deterministic_dependency_aware_list_scheduler",
+  "stage_overlap": "disabled",
+  "retry_policy": "attempts_and_backoff_from_event_log",
+  "applicability": [
+    "Frozen for HARMLP with input dimension 561, 6 classes and batch size 32.",
+    "Training calibration is the mean of two consecutive measurements differing by 5.05 percent.",
+    "Aggregation calibration uses CPU weighted averaging and is a fitted proxy.",
+    "Node capacities are scenario-normalized proxies, not measurements of physical client devices.",
+    "Logical DRIFT hops are simulated protocol transfers, not measured Actor-to-Actor wall-clock communication."
+  ]
+}

@@ -1,6 +1,8 @@
 #!/bin/bash
 # JSD 阈值消融实验：0.1/0.2/0.3/0.5
-cd /home/yjq/De-ASFL-V8-3-加入训练-基本实现
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
 LOG_DIR="outputs/ablation_jsd_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOG_DIR"
 
@@ -27,7 +29,7 @@ for i in "${!CONFIGS[@]}"; do
     ray stop --force 2>/dev/null
     sleep 3
 
-    conda run -n fl_env python test_30_clients.py --config "${cfg}" \
+    python scripts/test_30_clients.py --config "${cfg}" \
         2>&1 | tee "${LOG_DIR}/run_${idx}_$(basename ${cfg} .yaml).log"
 
     echo "===== [$idx/${TOTAL}] 完成: ${cfg} ====="

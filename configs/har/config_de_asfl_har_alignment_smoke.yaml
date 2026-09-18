@@ -1,0 +1,48 @@
+# HAR aligned smoke: only for checking shared frozen inputs across methods.
+experiment_name: de_asfl_har_alignment_smoke
+output_dir: outputs/har_alignment_smoke
+seed: 42
+deterministic_training: true
+frozen_inputs_dir: ""
+strict_frozen_inputs: true
+
+dataset: har
+data_dir: ./data
+dataset_split_policy: official_subject_split
+har_local_val_seed: 42
+model: harmlp
+input_dim: 561
+num_classes: 6
+
+num_clients: 5
+rounds: 1
+local_epochs: 2
+batch_size: 32
+learning_rate: 0.001
+weight_decay: 0.0001
+learning_rate_min: 0.0001
+warmup_rounds: 1
+cosine_annealing: true
+learning_rate_schedule_rounds: 1
+
+partition: dirichlet
+alpha: 1.0
+algorithm: de_asfl
+aggregation_strategy: hierarchical_weighted
+
+topology_type: mesh
+neighbor_selection: random
+min_neighbors: 2
+max_neighbors: 3
+enable_election: true
+enable_clustering: true
+cluster_max_child: 3
+cluster_max_retry: 3
+cluster_offset: 30.0
+cluster_trigger_factor: 0.05
+distribution_similarity_threshold: 0.0
+
+use_gpu: true
+num_gpus: 0.066
+max_concurrent_gpu_clients: 8
+drop_rate: 0.0

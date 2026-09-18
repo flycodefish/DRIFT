@@ -32,7 +32,10 @@ from datetime import datetime
 import glob
 
 from deasfl import NewFLConfig, NewFLRuntime
-from deasfl.runtime import load_cifar10_data, load_cifar100_data, load_neu_data, load_har_data
+from deasfl.runtime import (
+    load_cifar10_data, load_cifar100_data, load_neu_data, load_har_data,
+    resolve_dataset_split_policy,
+)
 
 
 def _is_experiment_complete(experiment_name: str, min_rounds: int = 90) -> bool:
@@ -96,7 +99,12 @@ def run_single_experiment(config_path: str, override_params: dict = None) -> dic
         elif cfg.dataset == 'har':
             train_data, val_data, indices, global_test_data, label_dists = load_har_data(
                 data_dir=cfg.data_dir, num_clients=cfg.num_clients,
-                partition_mode=cfg.partition, alpha=cfg.alpha)
+                partition_mode=cfg.partition, alpha=cfg.alpha,
+                seed=cfg.seed,
+                client_indices=(runtime.frozen_inputs["data_partition.json"]["client_indices"]
+                                if runtime.frozen_inputs else None),
+                split_policy=resolve_dataset_split_policy(cfg.dataset, cfg.dataset_split_policy),
+                local_val_seed=cfg.har_local_val_seed)
         elif cfg.dataset == 'cifar100':
             train_data, val_data, indices, global_test_data, label_dists = load_cifar100_data(
                 data_dir=cfg.data_dir, num_clients=cfg.num_clients,
@@ -104,7 +112,9 @@ def run_single_experiment(config_path: str, override_params: dict = None) -> dic
         else:
             train_data, val_data, indices, global_test_data, label_dists = load_cifar10_data(
                 data_dir=cfg.data_dir, num_clients=cfg.num_clients,
-                partition_mode=cfg.partition, alpha=cfg.alpha)
+                partition_mode=cfg.partition, alpha=cfg.alpha, seed=cfg.seed,
+                client_indices=(runtime.frozen_inputs["data_partition.json"]["client_indices"]
+                                if runtime.frozen_inputs else None))
 
         runtime.label_distributions = label_dists
 
@@ -130,15 +140,15 @@ def run_single_experiment(config_path: str, override_params: dict = None) -> dic
             runtime.tree_mapping = None
 
         # Ray Actor + 训练
-        runtime._init_ray_actors(train_data, val_data)
+        runtime._init_ray_actors(train_data, val_data, global_test_data)
         training_results = runtime.run_training(num_rounds=cfg.rounds)
 
     finally:
         runtime.shutdown()
 
     # ---- 构建结果摘要 ----
-    live_final_accs = [a for i, a in enumerate(training_results['final_client_accuracies'])
-                       if i not in runtime.failed_nodes]
+    final_global_acc = (float(training_results['global_accuracies'][-1])
+                        if training_results['global_accuracies'] else 0.0)
     failure_rounds = [f['round'] for f in training_results['failure_log']]
 
     summary = {
@@ -153,10 +163,9 @@ def run_single_experiment(config_path: str, override_params: dict = None) -> dic
         'failure_rounds': failure_rounds,
         'best_client_id': election_result.get('best_client_id', -1),
         'best_client_failed': election_result.get('best_client_id', -1) in runtime.failed_nodes,
-        'final_avg_acc': float(np.mean(live_final_accs)) if live_final_accs else 0.0,
-        'final_max_acc': float(np.max(live_final_accs)) if live_final_accs else 0.0,
-        'final_global_acc': float(training_results['global_accuracies'][-1])
-            if training_results['global_accuracies'] else 0.0,
+        'final_avg_acc': final_global_acc,
+        'final_max_acc': final_global_acc,
+        'final_global_acc': final_global_acc,
         'training_time': training_results['training_time'],
         'num_rounds': cfg.rounds,
         'num_clients': cfg.num_clients,
@@ -169,7 +178,8 @@ def run_single_experiment(config_path: str, override_params: dict = None) -> dic
 
 def run_batch_experiments(base_config: str, failure_rates: list, patterns: list,
                           failure_start_round: int = 20, max_failures: int = 10,
-                          recovery: str = "skip", resume: bool = False):
+                          recovery: str = "skip", resume: bool = False,
+                          data_dir: str | None = None):
     """批量运行不同参数组合的实验
 
     Args:
@@ -192,6 +202,8 @@ def run_batch_experiments(base_config: str, failure_rates: list, patterns: list,
         'recovery_strategy': 'skip',
         'experiment_name': baseline_name,
     }
+    if data_dir:
+        baseline_override['data_dir'] = data_dir
     exp_idx = 0
 
     if resume and _is_experiment_complete(baseline_name):
@@ -227,6 +239,8 @@ def run_batch_experiments(base_config: str, failure_rates: list, patterns: list,
                 'node_join_enabled': False,
                 'experiment_name': exp_name,
             }
+            if data_dir:
+                override['data_dir'] = data_dir
             summary = run_single_experiment(base_config, override)
             all_summaries.append(summary)
 
@@ -267,6 +281,8 @@ def main():
     parser = argparse.ArgumentParser(description='Dynamic Node Failure/Join Experiments')
     parser.add_argument('--config', type=str, default=None,
                        help='YAML 配置文件路径')
+    parser.add_argument('--data-dir', type=str, default=None,
+                       help='数据集根目录，覆盖配置文件中的 data_dir')
     parser.add_argument('--batch', action='store_true',
                        help='批量运行多个参数组合')
     parser.add_argument('--base-config', type=str,
@@ -298,9 +314,11 @@ def main():
             max_failures=args.max_failures,
             recovery=args.recovery,
             resume=args.resume,
+            data_dir=args.data_dir,
         )
     elif args.config:
-        summary = run_single_experiment(args.config)
+        overrides = {'data_dir': args.data_dir} if args.data_dir else None
+        summary = run_single_experiment(args.config, overrides)
         print(f"\n{'='*80}")
         print(f"Experiment Complete!")
         print(f"{'='*80}")

@@ -15,7 +15,7 @@
 3. 收敛阶段：所有节点就最优节点达成一致
 4. 路由阶段：每个节点记录到最优节点的路径和下一跳
 
-参考：/home/yjq/De-ASFL-V8/bestclient.md
+实现资源感知的分布式选举和聚类协议。
 """
 
 import time
@@ -64,7 +64,8 @@ class DistributedElection:
     def __init__(self, client_id: int, neighbors: List[int],
                  resource_params: Optional[Dict] = None,
                  base_trigger_time: float = 10.0,
-                 trigger_factor: float = 0.1):
+                 trigger_factor: float = 0.1,
+                 seed: int = 42):
         """
         初始化选举模块
 
@@ -77,6 +78,7 @@ class DistributedElection:
         """
         self.client_id = client_id
         self.neighbors = neighbors
+        self.rng = random.Random(seed)
 
         self.base_trigger_time = base_trigger_time
         self.trigger_factor = trigger_factor
@@ -86,7 +88,10 @@ class DistributedElection:
 
         self.best_client_table = BestClientTable()
 
-        self.resource_score = self._calculate_resource_score(resource_params)
+        if resource_params is None:
+            resource_params = self._generate_random_resources()
+        self.resource_params = dict(resource_params)
+        self.resource_score = self._calculate_resource_score(self.resource_params)
         self.trigger_time = self._calculate_trigger_time()
 
         self.election_in_progress = False
@@ -117,12 +122,15 @@ class DistributedElection:
         if resource_params is None:
             resource_params = self._generate_random_resources()
 
+        if "resource_score_override" in resource_params:
+            return max(0.1, float(resource_params["resource_score_override"]))
+
         cpu_score = resource_params.get('cpu_cores', 4) * 3       # 6-48
         memory_score = resource_params.get('memory_gb', 8) * 0.8   # 3.2-51.2
         bandwidth_score = resource_params.get('bandwidth_mbps', 100) * 0.02  # 1-20
         gpu_score = resource_params.get('gpu_memory_gb', 0) * 1.5  # 0-48
 
-        noise = random.uniform(-0.5, 0.5)
+        noise = self.rng.uniform(-0.5, 0.5)
 
         total_score = cpu_score + memory_score + bandwidth_score + gpu_score + noise
 
@@ -136,10 +144,10 @@ class DistributedElection:
             资源参数字典
         """
         return {
-            'cpu_cores': random.randint(2, 16),
-            'memory_gb': random.randint(4, 64),
-            'bandwidth_mbps': random.randint(50, 1000),
-            'gpu_memory_gb': random.choice([0, 4, 8, 16, 32])
+            'cpu_cores': self.rng.randint(2, 16),
+            'memory_gb': self.rng.randint(4, 64),
+            'bandwidth_mbps': self.rng.randint(50, 1000),
+            'gpu_memory_gb': self.rng.choice([0, 4, 8, 16, 32])
         }
 
     def _calculate_trigger_time(self) -> float:
@@ -156,7 +164,7 @@ class DistributedElection:
         """
         base_time = self.base_trigger_time
         score_factor = self.resource_score * self.trigger_factor
-        noise = random.uniform(0, 0.1)
+        noise = self.rng.uniform(0, 0.1)
 
         trigger_time = base_time - score_factor + noise
 
@@ -304,8 +312,16 @@ class DistributedElection:
                 hops=msg.hops,
                 next_hop=msg.sender_id if msg.hops > 0 else msg.candidate_id
             )
-        elif (msg.candidate_score == self.best_client_table.candidate_score and
-              msg.hops < self.best_client_table.hops):
+        elif (
+            msg.candidate_score == self.best_client_table.candidate_score
+            and (
+                msg.candidate_id < self.best_client_table.candidate_id
+                or (
+                    msg.candidate_id == self.best_client_table.candidate_id
+                    and msg.hops < self.best_client_table.hops
+                )
+            )
+        ):
             should_relay = True
             self.best_client_table = BestClientTable(
                 candidate_id=msg.candidate_id,
@@ -330,6 +346,7 @@ class DistributedElection:
             'next_hop': self.best_client_table.next_hop,
             'is_best_client': self.best_client_table.candidate_id == self.client_id,
             'my_score': self.resource_score,
+            'resource_params': self.resource_params,
             'my_trigger_time': self.trigger_time
         }
 
@@ -373,7 +390,9 @@ class ElectionManager:
 
     def __init__(self, clients: List, topology: List[List[int]],
                  base_trigger_time: float = 10.0,
-                 trigger_factor: float = 0.1):
+                 trigger_factor: float = 0.1,
+                 seed: int = 42,
+                 resource_params: Optional[List[Dict]] = None):
         """
         初始化选举管理器
 
@@ -386,15 +405,17 @@ class ElectionManager:
         self.clients = clients
         self.topology = topology
         self.num_clients = len(clients)
+        self.resource_params = resource_params
 
         self.election_states: List[DistributedElection] = []
 
-        self._init_election_states(base_trigger_time, trigger_factor)
+        self._init_election_states(base_trigger_time, trigger_factor, seed)
 
         self.best_client_id: Optional[int] = None
         self.election_complete = False
 
-    def _init_election_states(self, base_trigger_time: float, trigger_factor: float):
+    def _init_election_states(self, base_trigger_time: float,
+                              trigger_factor: float, seed: int):
         """初始化所有节点的选举状态"""
         for i in range(self.num_clients):
             neighbors = self.topology[i] if i < len(self.topology) else []
@@ -402,8 +423,12 @@ class ElectionManager:
             state = DistributedElection(
                 client_id=i,
                 neighbors=neighbors,
+                resource_params=(self.resource_params[i]
+                                 if self.resource_params and i < len(self.resource_params)
+                                 else None),
                 base_trigger_time=base_trigger_time,
-                trigger_factor=trigger_factor
+                trigger_factor=trigger_factor,
+                seed=seed + i,
             )
 
             self.election_states.append(state)
@@ -863,7 +888,18 @@ class DistributedClustering:
         if self.state == ClusterState.CLUSTER_HEAD:
             return self._reject_request(msg)
 
-        # 规则3：已触发（处理同时触发冲突）
+        # 规则3：数据分布相似度检查。该约束必须先于“同时触发”冲突
+        # 处理，否则同时触发的节点可能绕过 JSD 阈值直接组成父子边。
+        if (self.label_distribution is not None and
+                msg.sender_label_distribution is not None and
+                self.distribution_similarity_threshold > 0):
+            jsd = self._compute_js_divergence(
+                self.label_distribution, msg.sender_label_distribution
+            )
+            if jsd > self.distribution_similarity_threshold:
+                return self._reject_request(msg)
+
+        # 规则4：已触发（处理同时触发冲突）
         if self.state == ClusterState.TRIGGERED:
             # 检查是否为同时触发（触发时间差在阈值内）
             if msg.sender_trigger_time is not None:
@@ -883,17 +919,6 @@ class DistributedClustering:
                     return self._reject_request(msg)
             else:
                 # 非同时触发，已触发的节点拒绝（保证簇首稳定性）
-                return self._reject_request(msg)
-
-        # 规则4：数据分布相似度检查（分布感知聚类）
-        if (self.label_distribution is not None and
-                msg.sender_label_distribution is not None and
-                self.distribution_similarity_threshold > 0):
-            jsd = self._compute_js_divergence(
-                self.label_distribution, msg.sender_label_distribution
-            )
-            if jsd > self.distribution_similarity_threshold:
-                # 分布差异太大，拒绝
                 return self._reject_request(msg)
 
         # 规则5：无父节点 + 未触发 → 接受

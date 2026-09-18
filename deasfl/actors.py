@@ -18,12 +18,26 @@
 """
 
 import ray
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from typing import List, Dict, Optional
 import torchvision.transforms as T
+from fl_core.data_loader import MergeSingletonBatchSampler
+
+
+def _apply_deterministic_settings(enabled: bool) -> None:
+    """Apply the same deterministic backend policy as the FedAvg actor."""
+    if not enabled:
+        return
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
 @ray.remote(num_cpus=0.05, max_concurrency=4, num_gpus=0.066)
 class NewClientActor:
@@ -50,9 +64,13 @@ class NewClientActor:
     def __init__(self, client_id: int, model, train_dataset, val_dataset,
                  batch_size: int, lr: float, weight_decay: float,
                  device=None, neighbors: Optional[List[int]] = None,
-                 use_image_transform: bool = True):
+                 use_image_transform: bool = True, seed: int = 42,
+                 deterministic_training: bool = True,
+                 merge_singleton_batch: bool = False):
+        _apply_deterministic_settings(deterministic_training)
         # 客户端基本信息
         self.client_id = client_id
+        self.seed = seed
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -72,11 +90,21 @@ class NewClientActor:
         
         # 创建数据加载器
         # DataLoader负责将数据集分成批次，支持多线程加载
-        self.train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size, 
-            shuffle=True  # 训练时打乱数据顺序
-        )
+        loader_generator = torch.Generator().manual_seed(seed)
+        if merge_singleton_batch:
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_sampler=MergeSingletonBatchSampler(
+                    train_dataset, batch_size, generator=loader_generator
+                ),
+            )
+        else:
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                generator=loader_generator,
+            )
         self.val_loader = DataLoader(
             val_dataset, 
             batch_size=batch_size, 
@@ -107,6 +135,13 @@ class NewClientActor:
         if not self._model_on_gpu and self.device.type == 'cuda':
             self.model = self.model.to(self.device)
             self._model_on_gpu = True
+
+    def _offload_from_cuda(self):
+        """Return the persistent model to CPU after one bounded GPU task."""
+        if self._model_on_gpu:
+            self.model = self.model.cpu()
+            self._model_on_gpu = False
+            torch.cuda.empty_cache()
 
     def set_local_epochs(self, epochs: int):
         """
@@ -148,7 +183,7 @@ class NewClientActor:
         """
         self.model.load_state_dict(params)
     
-    def local_train(self, round_id: int):
+    def local_train(self, round_id: int, intra_round_id: int = 0):
         """
         执行本地训练
 
@@ -165,6 +200,12 @@ class NewClientActor:
         4. 返回训练统计信息
         """
         self._ensure_cuda()
+        # Preserve the original seed stream when K=1 while giving additional
+        # intra-cluster rounds deterministic, distinct data augmentation.
+        train_seed = self.seed + round_id + intra_round_id * 1_000_003
+        torch.manual_seed(train_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(train_seed)
         # 每轮重建优化器（对齐 FedAvg/Gossip）
         optimizer = torch.optim.Adam(
             self.model.parameters(),
@@ -201,7 +242,7 @@ class NewClientActor:
         # 释放本轮优化器
         optimizer.zero_grad(set_to_none=True)
         del optimizer
-        torch.cuda.empty_cache()  # 清理所有未使用的显存
+        self._offload_from_cuda()
         
         # 计算平均损失
         avg_loss = total_loss / total_samples
@@ -252,11 +293,14 @@ class NewClientActor:
         avg_loss = total_loss / total
         accuracy = correct / total
         
-        return {
+        result = {
             'client_id': self.client_id,
             'val_loss': avg_loss,
-            'val_acc': accuracy
+            'val_acc': accuracy,
+            'num_samples': total,
         }
+        self._offload_from_cuda()
+        return result
     
     def clear_cache(self):
         """

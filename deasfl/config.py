@@ -32,19 +32,25 @@ class NewFLConfig:
     >>> cfg = NewFLConfig(num_clients=30, rounds=100)
     >>> cfg = NewFLConfig.from_yaml("config.yaml")
     """
+    frozen_inputs_dir: str = ""  # shared immutable input bundle; empty = generate
+    strict_frozen_inputs: bool = False  # require complete schema/coverage for formal runs
     
     # ==================== 实验设置 ====================
     experiment_name: str = "deasfl"  # 实验名称，用于输出目录命名
     output_dir: str = "outputs"       # 输出目录
     run_name: str = ""                # 运行名称（可选）
     seed: int = 42                    # 随机种子，确保实验可重复
+    deterministic_training: bool = True  # 在 Ray Worker 内启用确定性 GPU 执行
     
     # ==================== 数据集设置 ====================
     dataset: str = "cifar10"   # 数据集类型：cifar10, mnist 等
     data_dir: str = "./data"   # 数据集存储路径
+    dataset_split_policy: str = "default"
+    har_local_val_seed: int = 42
     
     # ==================== 模型设置 ====================
     model: str = "resnet18"     # 模型类型：resnet18, resnet34 等
+    input_dim: int = 561        # 向量模型输入维度（HARMLP）
     num_classes: int = 10       # 分类类别数（CIFAR-10 为 10）
     
     # ==================== 训练设置 ====================
@@ -59,6 +65,7 @@ class NewFLConfig:
     learning_rate_min: float = 1e-5  # 最小学习率（cosine退火结束值）
     warmup_rounds: int = 5           # warmup轮数（学习率线性增长阶段）
     cosine_annealing: bool = True    # 是否启用cosine退火
+    learning_rate_schedule_rounds: int = 0  # 0 = follow rounds
     
     # ==================== 数据划分设置 ====================
     partition: str = "dirichlet"  # 数据划分策略：dirichlet, random 等
@@ -77,6 +84,7 @@ class NewFLConfig:
 
     # ==================== 选举设置 ====================
     enable_election: bool = True           # 是否启用分布式选举
+    resource_awareness: bool = True        # False = equal frozen score ablation
     election_base_trigger_time: float = 10.0  # 选举基础触发时间（秒）
     election_trigger_factor: float = 0.1   # 选举触发时间因子（得分乘数）
     cpu_cores_range: tuple = (2, 16)       # CPU核心数随机范围
@@ -86,12 +94,20 @@ class NewFLConfig:
 
     # ==================== 聚类设置 ====================
     enable_clustering: bool = True         # 是否启用分布式聚类
+    clustering_assignment_mode: str = "distributed"  # distributed or opt-in experimental assignment
     cluster_max_child: int = 3             # 每个簇首最大子节点数
     cluster_max_retry: int = 3             # 聚合请求最大重试次数
     cluster_request_timeout: float = 2.0    # 请求超时时间（秒）
     cluster_offset: float = 30.0           # 聚类触发时间偏移量（秒）
     cluster_trigger_factor: float = 0.05    # 聚类触发时间因子
     distribution_similarity_threshold: float = 0.0  # 分布感知聚类JSD阈值（0=禁用，0.3=中等相似度）
+    intra_cluster_rounds: int = 1       # 每次全局聚合前的簇内训练-聚合轮数（1=原协议）
+    enable_cluster_diagnostics: bool = False  # 独立记录簇模型指标；默认关闭，不影响正式路径
+    cluster_diagnostics_interval: int = 1     # 每隔多少轮评价一次簇模型
+    cluster_diagnostics_global_test: bool = True  # 同时评价簇模型在完整全局测试集上的表现
+    client_test_partition_mode: str = "global_balanced"  # global_balanced | match_train_distribution
+    enable_cluster_personalized_evaluation: bool = False  # opt-in reviewer experiment
+    method_name: str = ""                    # 可选实验变体名称，仅影响输出标识
 
     # ==================== 动态节点设置（Node Failure / Join） ====================
     enable_dynamic_nodes: bool = False     # 是否启用动态节点故障/加入
@@ -115,7 +131,8 @@ class NewFLConfig:
     
     # ==================== 设备设置 ====================
     use_gpu: bool = True   # 是否使用GPU
-    num_gpus: float = 0.05 # 每个客户端分配的GPU资源比例
+    num_gpus: float = 0.066 # 30 客户端在 2 GPU 上约 15/15 分布
+    max_concurrent_gpu_clients: int = 8  # 同时驻留 GPU 的 Actor 上限
     
     # ==================== 日志设置 ====================
     log_interval: int = 1      # 日志打印间隔（轮数）

@@ -2,6 +2,7 @@
 experiment_name: deasfl_test
 output_dir: outputs
 seed: 42
+deterministic_training: true
 
 dataset: cifar10
 data_dir: ./data
@@ -50,8 +51,9 @@ latency: null
 drop_rate: 0.0
 async_communication: true
 
-use_gpu: false
-num_gpus: 0.0
+use_gpu: true
+num_gpus: 0.066
+max_concurrent_gpu_clients: 8
 
 log_interval: 1
 save_model: false

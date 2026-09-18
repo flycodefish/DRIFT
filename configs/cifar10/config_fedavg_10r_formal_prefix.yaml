@@ -1,0 +1,43 @@
+algorithm: fedavg
+program_name: fedavg_cifar10_10r_formal_prefix
+topology: star
+neighbor_strategy: random_per_round
+neighbor_k: 3
+
+seed: 42
+deterministic_training: true
+frozen_inputs_dir: outputs/frozen_cifar10_30c_seed42/config
+num_clients: 30
+rounds: 10
+local_epochs: 2
+batch_size: 64
+learning_rate: 0.001
+weight_decay: 0.0001
+learning_rate_min: 1e-4
+warmup_rounds: 5
+cosine_annealing: true
+learning_rate_schedule_rounds: 100
+client_sample_ratio: 1.0
+client_drop_rate: 0.0
+
+dataset: cifar10
+data_dir: ./data
+model: resnet18
+num_classes: 10
+input_dim: 3072
+data_partition_mode: dirichlet
+dirichlet_alpha: 0.1
+classes_per_client: 2
+
+link_bandwidth_mbps: 100.0
+link_latency_ms: 5.0
+link_drop_rate: 0.0
+link_profile_mode: homogeneous
+client_speed_mode: uniform
+client_network_mode: uniform
+client_storage_mode: uniform
+
+output_dir: outputs
+use_gpu: true
+num_gpus: 0.066
+max_concurrent_gpu_clients: 8

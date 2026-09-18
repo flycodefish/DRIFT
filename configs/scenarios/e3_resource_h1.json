@@ -1,0 +1,7 @@
+{
+  "name": "e3_resource_h1",
+  "purpose": "Resource-ablation control with homogeneous compute capacity.",
+  "resource_profile": {"mode": "homogeneous", "capacity": 1.0},
+  "network_profile": {"mode": "medium_heterogeneous"},
+  "failure_profile": {"mode": "none"}
+}

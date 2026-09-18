@@ -1,3 +1,5 @@
+# LEGACY CONFIG: historical HAR run (alpha=0.1). Use a frozen-input formal
+# configuration generated from FINAL_EXPERIMENT_PLAN.md for new experiments.
 # Gossip 工业场景验证 — HAR 人体活动识别数据集
 # 12客户端，80轮，MLP模型，Mesh拓扑，随机邻居
 
@@ -25,6 +27,9 @@ client_drop_rate: 0.0
 
 # Data settings
 dataset: har
+data_dir: ./data
+dataset_split_policy: official_subject_split
+har_local_val_seed: 42
 model: harmlp
 num_classes: 6
 input_dim: 561

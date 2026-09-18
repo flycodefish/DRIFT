@@ -1,7 +1,9 @@
 #!/bin/bash
 # DTD 对比基线实验：α频谱 + CIFAR-100 + NEU + HAR
 # 共8组，50客户端CIFAR-100放最后（显存压力最大）
-cd /home/yjq/De-ASFL-V8-3-加入训练-基本实现
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
 LOG_DIR="outputs/dtd_baseline_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOG_DIR"
 
@@ -35,7 +37,7 @@ for i in "${!CONFIGS[@]}"; do
     ray stop --force 2>/dev/null
     sleep 3
 
-    conda run -n fl_env python run_fl.py --config "${cfg}" \
+    python scripts/run_fl.py --config "${cfg}" \
         2>&1 | tee "${LOG_DIR}/run_${idx}_$(basename ${cfg} .yaml).log"
 
     echo "===== [${idx}/${TOTAL}] 完成: ${cfg} ====="

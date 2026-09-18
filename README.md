@@ -1,72 +1,110 @@
-# DE-ASFL: Decentralized Adaptive Stratified Federated Learning
+# DE-ASFL
 
-A dual-aware routing framework for heterogeneous decentralized federated learning.
+DE-ASFL is a research implementation of decentralized, hierarchical federated
+learning under device, network, and data heterogeneity. The repository contains
+the framework, baselines, experiment configurations, launchers, and regression
+tests needed to run the code. Datasets, trained models, experiment outputs,
+manuscripts, and review materials are intentionally not included.
 
-## Overview
+## Repository layout
 
-DE-ASFL addresses the dual heterogeneity challenge (device + data) in decentralized FL through two core components:
-
-1. **Resource-Aware Distributed Election** — Trigger-time-based mechanism that elects the highest-capability node as the global aggregator in a mesh topology.
-2. **Distribution-Aware Adaptive Clustering** — JSD-based clustering that organizes nodes with similar label distributions into tree-structured clusters for hierarchical aggregation.
-
-## Project Structure
-
-```
-├── fl_core/          # Base FL framework (FedAvg, Gossip, DTD, topology, monitor)
-├── deasfl/           # DE-ASFL extension (election, clustering, hierarchical aggregation)
-├── configs/          # Experiment configuration files (YAML)
-│   ├── cifar10/
-│   ├── cifar100/
-│   ├── neu/
-│   └── har/
-├── scripts/          # Experiment entry points and batch runners
-├── figures/          # Paper figure generation scripts and outputs
-├── paper/            # Paper manuscript and experiment notes
-├── outputs/          # Experiment outputs (git-ignored)
-└── data/             # Datasets (git-ignored, see below)
+```text
+baselines/   Baseline decentralized and hierarchical FL implementations
+deasfl/      Election, clustering, aggregation, and DE-ASFL runtime
+fl_core/     Shared data, runtime, monitoring, and simulation utilities
+configs/     Dataset, method, and scenario configurations
+scripts/     Training, experiment-matrix, analysis, and verification entrypoints
+tests/       Unit and regression tests
 ```
 
-## Installation
+## Environment
+
+The frozen `environment.yml` matches the release validation environment:
+
+- Python 3.10.20
+- PyTorch 2.8.0 and torchvision 0.23.0
+- CUDA runtime 12.8
+- Ray 2.51.1
 
 ```bash
 conda env create -f environment.yml
-conda activate fl_env
+conda activate de-asfl
 ```
 
-## Datasets
+The validated GPU host used NVIDIA RTX 4090 GPUs with driver 550.127.05. CPU
+unit tests do not require a GPU. Other compatible CUDA GPUs may be used.
 
-Download datasets to the `data/` directory:
+## Data
 
-- **CIFAR-10 / CIFAR-100**: Auto-downloaded by torchvision
-- **NEU-DET**: Auto-downloaded by kagglehub
-- **UCI HAR**: [Download](https://archive.ics.uci.edu/ml/machine-learning-databases/00240/) → `data/har/UCI HAR Dataset/`
+The default data root is `./data` and can be overridden by launcher options.
 
-## Quick Start
+- CIFAR-10/CIFAR-100 are downloaded by torchvision when absent.
+- NEU-DET is downloaded through kagglehub when absent.
+- UCI HAR must be downloaded separately and extracted as
+  `data/har/UCI HAR Dataset/`.
+
+Datasets are excluded from Git.
+
+## Quick validation
+
+Run the complete CPU-compatible regression suite:
 
 ```bash
-# DE-ASFL on CIFAR-10 (30 clients, Dirichlet α=0.1)
-python scripts/test_30_clients.py --config configs/cifar10/config_de_asfl.yaml
-
-# FedAvg baseline
-python scripts/run_fl.py --config configs/cifar10/config_fedavg.yaml
-
-# Gossip baseline
-python scripts/run_fl.py --config configs/cifar10/config_gossip.yaml
-
-# DTD baseline
-python scripts/run_fl.py --config configs/cifar10/config_dtd_cifar10_alpha01.yaml
+python -m pytest -q
 ```
 
-## Citation
+Run a one-round CIFAR-10 DE-ASFL check:
 
-```bibtex
-@article{deasfl2026,
-  title   = {Towards Robust Decentralized Federated Learning: A Dual-Aware Routing Framework and Its Industrial Validation},
-  journal = {},
-  year    = {2026},
-}
+```bash
+python scripts/test_30_clients.py \
+  --config configs/cifar10/config_de_asfl_test.yaml \
+  --rounds 1 \
+  --data-dir ./data
 ```
+
+Run the FedAvg baseline:
+
+```bash
+python scripts/run_fl.py \
+  --config configs/cifar10/config_fedavg_test.yaml \
+  --data-dir ./data
+```
+
+## Reproducible experiment matrices
+
+`scripts/run_experiment_matrix.py` freezes data partitions, initial models,
+physical graphs, resources, links, and failure traces for aligned comparisons.
+
+```bash
+python scripts/run_experiment_matrix.py \
+  --run-smoke \
+  --dataset cifar10 \
+  --model resnet18 \
+  --scenario reproducibility_smoke \
+  --scenario-spec configs/scenarios/e2_static_tradeoff.json \
+  --template-dir configs/cifar10 \
+  --output-root outputs/reproducibility_smoke \
+  --methods fedavg,drift \
+  --seeds 42 \
+  --num-clients 5 \
+  --rounds 1 \
+  --local-epochs 1 \
+  --batch-size 32 \
+  --partition dirichlet \
+  --alpha 0.5 \
+  --data-dir ./data
+```
+
+The centralized matched-cluster and JSD-quantile assignment modes are
+experimental controls. They are opt-in and are not part of the deployable
+distributed protocol. Cluster diagnostics and cluster-personalized evaluation
+are also disabled by default.
+
+## Outputs
+
+Generated datasets, frozen inputs, checkpoints, logs, metrics, and figures are
+written below `outputs/` and are ignored by Git.
 
 ## License
 
-TBD
+This project is released under the MIT License. See `LICENSE`.

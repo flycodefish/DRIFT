@@ -67,7 +67,9 @@ def run_join_experiment(strategy: str, config_path: str,
     try:
         train_data, val_data, indices, global_test_data, label_dists = load_cifar10_data(
             data_dir=cfg.data_dir, num_clients=cfg.num_clients,
-            partition_mode=cfg.partition, alpha=cfg.alpha)
+            partition_mode=cfg.partition, alpha=cfg.alpha, seed=cfg.seed,
+            client_indices=(runtime.frozen_inputs["data_partition.json"]["client_indices"]
+                            if runtime.frozen_inputs else None))
 
         runtime.label_distributions = label_dists
 
@@ -89,16 +91,15 @@ def run_join_experiment(strategy: str, config_path: str,
             runtime.clustering_results = None
             runtime.tree_mapping = None
 
-        runtime._init_ray_actors(train_data, val_data)
+        runtime._init_ray_actors(train_data, val_data, global_test_data)
         training_results = runtime.run_training(num_rounds=cfg.rounds)
 
     finally:
         runtime.shutdown()
 
     # 构建摘要
-    final_accs = training_results['final_client_accuracies']
-    live_ids = sorted(runtime.active_nodes)
-    live_final_accs = [final_accs[i] for i in live_ids if i < len(final_accs)]
+    final_global_acc = (float(training_results['global_accuracies'][-1])
+                        if training_results['global_accuracies'] else 0.0)
 
     summary = {
         'experiment_name': cfg.experiment_name,
@@ -108,10 +109,9 @@ def run_join_experiment(strategy: str, config_path: str,
         'join_round': join_round,
         'joined_nodes': sorted(runtime.joined_nodes),
         'join_log': training_results.get('join_log', []),
-        'final_global_acc': float(training_results['global_accuracies'][-1])
-            if training_results['global_accuracies'] else 0.0,
-        'final_avg_acc': float(np.mean(live_final_accs)) if live_final_accs else 0.0,
-        'final_max_acc': float(np.max(live_final_accs)) if live_final_accs else 0.0,
+        'final_global_acc': final_global_acc,
+        'final_avg_acc': final_global_acc,
+        'final_max_acc': final_global_acc,
         'training_time': training_results['training_time'],
         'num_rounds': cfg.rounds,
         'dataset': cfg.dataset,
@@ -155,7 +155,9 @@ def main():
     try:
         train_data, val_data, indices, global_test_data, label_dists = load_cifar10_data(
             data_dir=cfg.data_dir, num_clients=cfg.num_clients,
-            partition_mode=cfg.partition, alpha=cfg.alpha)
+            partition_mode=cfg.partition, alpha=cfg.alpha, seed=cfg.seed,
+            client_indices=(runtime.frozen_inputs["data_partition.json"]["client_indices"]
+                            if runtime.frozen_inputs else None))
         runtime.label_distributions = label_dists
         runtime.init_clients(train_data, val_data, indices)
         runtime.build_topology()
@@ -169,7 +171,7 @@ def main():
             runtime.init_clustering(er, cfg.cluster_max_child, cfg.cluster_offset)
             cr = runtime.run_clustering()
             runtime.set_clustering_results(cr, er)
-        runtime._init_ray_actors(train_data, val_data)
+        runtime._init_ray_actors(train_data, val_data, global_test_data)
         tr = runtime.run_training(num_rounds=cfg.rounds)
     finally:
         runtime.shutdown()

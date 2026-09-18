@@ -12,11 +12,13 @@ neighbor_k: 3
 
 # Training settings
 seed: 42
+deterministic_training: true
 num_clients: 30
 rounds: 100
 local_epochs: 2
 batch_size: 64
 learning_rate: 0.001
+weight_decay: 0.0001
 learning_rate_min: 1e-4
 warmup_rounds: 5
 cosine_annealing: true
@@ -25,6 +27,7 @@ client_drop_rate: 0.0
 
 # Data settings
 dataset: cifar10  # synthetic | cifar10
+data_dir: ./data
 model: resnet18  # cnn | resnet18
 num_classes: 10
 input_dim: 3072  # CIFAR-10: 32x32x3 = 3072
@@ -47,3 +50,6 @@ client_storage_mode: uniform  # uniform | two_group
 
 # Output settings
 output_dir: outputs
+use_gpu: true
+num_gpus: 0.066
+max_concurrent_gpu_clients: 8

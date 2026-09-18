@@ -1,0 +1,22 @@
+{
+  "name": "e4_multi_node_failure_pilot",
+  "purpose": "Single-seed trend pilot for a shared method-independent 20% transient node failure with connected survivors.",
+  "resource_profile": {
+    "mode": "tiers",
+    "reference_cpu_cores": 16,
+    "tiers": [
+      {"name": "slow", "fraction": 0.2, "capacity": 0.2},
+      {"name": "medium", "fraction": 0.6, "capacity": 0.5},
+      {"name": "fast", "fraction": 0.2, "capacity": 1.0}
+    ]
+  },
+  "network_profile": {"mode": "medium_heterogeneous"},
+  "failure_profile": {
+    "mode": "node_failure",
+    "failure_round": 20,
+    "recovery_round": 30,
+    "selection_rule": "uniform_random_connected",
+    "failure_count": 6,
+    "max_selection_attempts": 10000
+  }
+}

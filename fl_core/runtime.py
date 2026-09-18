@@ -31,10 +31,18 @@ os.environ.setdefault("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
 
 import ray
 import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
 from .actors import ClientActor, MLP, estimate_state_dict_bytes, get_model_params
 from .config import FLConfig
+from .data_loader import resolve_dataset_split_policy
 from .monitor import Monitor
+from .artifacts import (
+    failure_state_at_round, frozen_failure_events, generate_node_resources, load_frozen_inputs,
+    normalize_physical_graph, validate_frozen_inputs, write_completion_status,
+    write_experiment_inputs,
+)
 from .topology import build_neighbors
 
 
@@ -51,14 +59,45 @@ class RayFLRuntime:
         self.edge_overrides: dict[str, dict[str, float]] = {}
         self.neighbors: dict[int, list[int]] = {}
         self.train_shards = []
+        self.client_indices: list[list[int]] = []
         self.client_label_stats: list[dict[int, int]] = []
         self.val_x = None
         self.val_y = None
         self.run_name = f"{cfg.program_name}_{cfg.topology}_{cfg.num_clients}c_{cfg.rounds}r"
+        self.monitor.configure(self.run_name, cfg.algorithm, cfg.seed)
+        self.frozen_inputs = None
+        self.physical_graph_input = None
+        self.node_resources_input = None
 
     def start(self) -> None:
+        if self.cfg.use_gpu and not torch.cuda.is_available():
+            raise RuntimeError("GPU execution requested but CUDA is unavailable")
         random.seed(self.cfg.seed)
+        np.random.seed(self.cfg.seed)
         torch.manual_seed(self.cfg.seed)
+        if self.cfg.frozen_inputs_dir:
+            self.frozen_inputs = load_frozen_inputs(self.cfg.frozen_inputs_dir)
+            expected_fingerprint = None
+            if self.cfg.dataset == "har":
+                from .data_loader import har_dataset_fingerprint
+                expected_fingerprint = har_dataset_fingerprint(self.cfg.data_dir)
+            expected_split_policy = resolve_dataset_split_policy(
+                self.cfg.dataset, getattr(self.cfg, "dataset_split_policy", None)
+            )
+            validate_frozen_inputs(
+                self.frozen_inputs,
+                self.cfg.num_clients,
+                expected_dataset=self.cfg.dataset,
+                expected_split_policy=expected_split_policy,
+                expected_local_val_seed=(getattr(self.cfg, "har_local_val_seed", None)
+                                         if self.cfg.dataset == "har" else None),
+                expected_dataset_fingerprint=expected_fingerprint,
+                strict=getattr(self.cfg, "strict_frozen_inputs", False),
+            )
+        self.node_resources_input = (
+            self.frozen_inputs["node_resources.json"] if self.frozen_inputs
+            else generate_node_resources(self.cfg.num_clients, self.cfg.seed)
+        )
         ray.init(
             ignore_reinit_error=True,
             logging_level="ERROR",
@@ -76,6 +115,20 @@ class RayFLRuntime:
             self.cfg.neighbor_strategy,
             self.cfg.neighbor_k,
         )
+        self.neighbors = normalize_physical_graph(
+            self.neighbors, self.cfg.num_clients
+        )
+        frozen_graph = self.frozen_inputs and self.frozen_inputs["physical_graph.json"]
+        self.physical_graph_input = frozen_graph if frozen_graph is not None else self.neighbors
+        if frozen_graph is not None and self.cfg.algorithm != "fedavg":
+            if isinstance(frozen_graph, list):
+                self.neighbors = normalize_physical_graph(
+                    frozen_graph, self.cfg.num_clients
+                )
+            else:
+                self.neighbors = normalize_physical_graph(
+                    frozen_graph, self.cfg.num_clients
+                )
         # 生成拓扑图
         self._generate_topology_graph()
 
@@ -137,16 +190,18 @@ class RayFLRuntime:
 
     def _build_edge_overrides(self) -> None:
         self.edge_overrides = {}
-        if not self.cfg.edge_profile_json:
+        if self.frozen_inputs:
+            raw = self.frozen_inputs["link_profiles.json"].get("edge_overrides", {})
+        elif self.cfg.edge_profile_json:
+            try:
+                raw = json.loads(self.cfg.edge_profile_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid edge_profile_json: {exc}") from exc
+        else:
             return
 
-        try:
-            raw = json.loads(self.cfg.edge_profile_json)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid edge_profile_json: {exc}") from exc
-
         if not isinstance(raw, dict):
-            raise ValueError("edge_profile_json must be a JSON object")
+            raise ValueError("edge overrides must be a JSON object")
 
         for edge_key, edge_profile in raw.items():
             if not isinstance(edge_key, str) or "->" not in edge_key:
@@ -236,46 +291,29 @@ class RayFLRuntime:
         raise ValueError(f"Unsupported data_partition_mode: {self.cfg.data_partition_mode}")
 
     def _build_cifar10_data(self) -> None:
-        """Load and partition CIFAR-10 dataset."""
-        import torchvision
-        import torchvision.transforms as transforms
-        
-        # 加载原始数据（transform 仅用于 download，实际归一化手动完成）
-        trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=None)
-        testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=None)
+        """Load exactly the same CIFAR-10 partition used by DRIFT."""
+        from .data_loader import load_cifar10_data
 
-        # 合并数据集并分割为训练和验证集
-        all_data = np.concatenate([trainset.data, testset.data], axis=0)
-        all_labels = np.concatenate([np.array(trainset.targets), np.array(testset.targets)], axis=0)
-
-        # 转换数据格式并做 ImageNet 归一化（对齐 DE-ASFL）
-        all_data = torch.tensor(all_data).permute(0, 3, 1, 2).float() / 255.0
-        mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
-        std = torch.tensor([0.2023, 0.1994, 0.2010]).view(1, 3, 1, 1)
-        all_data = (all_data - mean) / std
-        all_labels = torch.tensor(all_labels)
-        
-        # 分割为训练和验证集
-        split = int(0.8 * len(all_data))
-        train_x, train_y = all_data[:split], all_labels[:split]
-        self.val_x, self.val_y = all_data[split:], all_labels[split:]
-        
-        self.train_shards = []
-        self.client_label_stats = []
-        
-        if self.cfg.data_partition_mode == "iid":
-            self._build_iid_shards(train_x, train_y)
-            return
-
-        if self.cfg.data_partition_mode == "label_skew":
-            self._build_label_skew_shards(train_x, train_y)
-            return
-
-        if self.cfg.data_partition_mode == "dirichlet":
-            self._build_dirichlet_shards(train_x, train_y)
-            return
-
-        raise ValueError(f"Unsupported data_partition_mode: {self.cfg.data_partition_mode}")
+        frozen_indices = None
+        if self.frozen_inputs:
+            frozen_indices = self.frozen_inputs["data_partition.json"]["client_indices"]
+        train_data, val_data, indices, global_test, _ = load_cifar10_data(
+            data_dir=self.cfg.data_dir,
+            num_clients=self.cfg.num_clients,
+            partition_mode=self.cfg.data_partition_mode,
+            alpha=self.cfg.dirichlet_alpha,
+            seed=self.cfg.seed,
+            client_indices=frozen_indices,
+        )
+        self.train_shards = [
+            (item['images'], item['labels']) for item in train_data
+        ]
+        self.client_indices = indices
+        self.client_label_stats = [
+            self._count_labels(item['labels']) for item in train_data
+        ]
+        self.val_x = global_test['images']
+        self.val_y = global_test['labels']
 
     def _build_cifar100_data(self) -> None:
         """Load and partition CIFAR-100 dataset."""
@@ -318,7 +356,7 @@ class RayFLRuntime:
         """Load and partition NEU-DET steel surface defect dataset."""
         from fl_core.data_loader import load_neu_data
 
-        train_data, val_data, _, _, _ = load_neu_data(
+        train_data, val_data, indices, _, _ = load_neu_data(
             data_dir='./data',
             num_clients=self.cfg.num_clients,
             partition_mode=self.cfg.data_partition_mode,
@@ -326,6 +364,7 @@ class RayFLRuntime:
         )
 
         self.train_shards = []
+        self.client_indices = indices
         self.client_label_stats = []
         for client_id in range(self.cfg.num_clients):
             x = train_data[client_id]['images']
@@ -344,16 +383,27 @@ class RayFLRuntime:
 
     def _build_har_data(self) -> None:
         """Load and partition UCI HAR human activity recognition dataset."""
-        from fl_core.data_loader import load_har_data
+        from fl_core.data_loader import har_dataset_fingerprint, load_har_data, tensor_fingerprint
+        split_policy = resolve_dataset_split_policy(
+            self.cfg.dataset, getattr(self.cfg, "dataset_split_policy", None)
+        )
 
-        train_data, val_data, _, _, _ = load_har_data(
-            data_dir='./data',
+        frozen_indices = None
+        if self.frozen_inputs:
+            frozen_indices = self.frozen_inputs["data_partition.json"]["client_indices"]
+        train_data, val_data, indices, global_test, _ = load_har_data(
+            data_dir=self.cfg.data_dir,
             num_clients=self.cfg.num_clients,
             partition_mode=self.cfg.data_partition_mode,
             alpha=self.cfg.dirichlet_alpha,
+            seed=self.cfg.seed,
+            client_indices=frozen_indices,
+            split_policy=split_policy,
+            local_val_seed=getattr(self.cfg, "har_local_val_seed", 42),
         )
 
         self.train_shards = []
+        self.client_indices = indices
         self.client_label_stats = []
         for client_id in range(self.cfg.num_clients):
             x = train_data[client_id]['images']
@@ -361,10 +411,30 @@ class RayFLRuntime:
             self.train_shards.append((x, y))
             self.client_label_stats.append(self._count_labels(y))
 
-        all_val_x = [val_data[cid]['images'] for cid in range(self.cfg.num_clients)]
-        all_val_y = [val_data[cid]['labels'] for cid in range(self.cfg.num_clients)]
-        self.val_x = torch.cat(all_val_x, dim=0)
-        self.val_y = torch.cat(all_val_y, dim=0)
+        self.val_x = global_test['images']
+        self.val_y = global_test['labels']
+        partition_count = sum(len(item["labels"]) for item in train_data)
+        local_validation_count = sum(len(item["labels"]) for item in val_data)
+        self.har_partition_metadata = {
+            "dataset": "har",
+            "split_policy": split_policy,
+            "local_val_seed": getattr(self.cfg, "har_local_val_seed", 42),
+            "partition_train_sample_count": partition_count,
+            "official_train_sample_count": partition_count + local_validation_count,
+            "local_validation_sample_count": local_validation_count,
+            "partition_index_space_size": partition_count,
+            "global_test_sample_count": len(global_test["labels"]),
+            "num_classes": self.cfg.num_classes,
+            "preprocessing": "official_train_mean_std_v1",
+            "dataset_fingerprint": har_dataset_fingerprint(self.cfg.data_dir),
+            "global_test_fingerprint": tensor_fingerprint(
+                global_test["images"], global_test["labels"]
+            ),
+        }
+        if self.frozen_inputs and getattr(self.cfg, "strict_frozen_inputs", False):
+            expected = self.frozen_inputs["data_partition.json"]
+            if expected["global_test_fingerprint"] != self.har_partition_metadata["global_test_fingerprint"]:
+                raise ValueError("Frozen HAR global test fingerprint does not match loaded data")
 
         print(f"HAR dataset loaded: {sum(len(s[0]) for s in self.train_shards)} train → {self.cfg.num_clients} clients, "
               f"{len(self.val_x)} val")
@@ -378,6 +448,7 @@ class RayFLRuntime:
             shard_idx = indices[start:end]
             shard_y = train_y[shard_idx]
             self.train_shards.append((train_x[shard_idx], shard_y))
+            self.client_indices.append(shard_idx.tolist())
             self.client_label_stats.append(self._count_labels(shard_y))
 
     def _build_label_skew_shards(self, train_x: torch.Tensor, train_y: torch.Tensor) -> None:
@@ -414,6 +485,7 @@ class RayFLRuntime:
             shard_idx_tensor = torch.tensor(shard_indices, dtype=torch.long)
             shard_y = train_y[shard_idx_tensor]
             self.train_shards.append((train_x[shard_idx_tensor], shard_y))
+            self.client_indices.append(shard_indices)
             self.client_label_stats.append(self._count_labels(shard_y))
 
         remaining_indices = []
@@ -426,6 +498,7 @@ class RayFLRuntime:
             extra_y = train_y[index].unsqueeze(0)
             updated_y = torch.cat([shard_y, extra_y], dim=0)
             self.train_shards[client_id] = (torch.cat([shard_x, extra_x], dim=0), updated_y)
+            self.client_indices[client_id].append(index)
             self.client_label_stats[client_id] = self._count_labels(updated_y)
 
     def _build_dirichlet_shards(self, train_x: torch.Tensor, train_y: torch.Tensor) -> None:
@@ -484,6 +557,7 @@ class RayFLRuntime:
             shard_idx = torch.tensor(client_indices[client_id], dtype=torch.long)
             shard_y = train_y[shard_idx]
             self.train_shards.append((train_x[shard_idx], shard_y))
+            self.client_indices.append(list(client_indices[client_id]))
             self.client_label_stats.append(self._count_labels(shard_y))
 
     @staticmethod
@@ -504,7 +578,8 @@ class RayFLRuntime:
         # 结合 lazy CUDA init，避免50个Actor同时初始化CUDA导致cuBLAS handle耗尽
         self.clients = []
         for client_id, (shard_x, shard_y) in enumerate(self.train_shards):
-            actor = ClientActor.remote(
+            actor_gpu = self.cfg.num_gpus if self.cfg.use_gpu else 0.0
+            actor = ClientActor.options(num_gpus=actor_gpu).remote(
                 client_id=client_id,
                 features=shard_x,
                 labels=shard_y,
@@ -516,6 +591,10 @@ class RayFLRuntime:
                 step_delay_ms=self.client_step_delays_ms[client_id],
                 dataset=dataset,
                 model=model,
+                seed=self.cfg.seed + client_id,
+                deterministic_training=self.cfg.deterministic_training,
+                weight_decay=self.cfg.weight_decay,
+                merge_singleton_batch=(self.cfg.dataset == "har"),
             )
             self.clients.append(actor)
 
@@ -531,6 +610,9 @@ class RayFLRuntime:
         print(f"CUDA warmup complete ({len(self.clients)} clients in {elapsed:.1f}s)")
 
     def init_model_params(self):
+        # Reset immediately before construction so topology/data code cannot
+        # perturb the shared initial checkpoint.
+        torch.manual_seed(self.cfg.seed)
         # 根据数据集类型和模型选择参数选择模型
         if hasattr(self.cfg, 'dataset') and self.cfg.dataset in ('cifar10', 'neu', 'cifar100'):
             if hasattr(self.cfg, 'model') and self.cfg.model == 'resnet18':
@@ -547,12 +629,106 @@ class RayFLRuntime:
             model = MLP(self.cfg.input_dim, self.cfg.num_classes)
         
         # 检查是否使用CUDA
-        if torch.cuda.is_available():
+        if self.cfg.use_gpu and torch.cuda.is_available():
             model = model.cuda()
         
-        return get_model_params(model)
+        params = get_model_params(model)
+        if self.frozen_inputs:
+            frozen = self.frozen_inputs["initial_model.pt"]
+            if params.keys() != frozen.keys():
+                raise ValueError("Frozen initial model is incompatible with configured model")
+            for key in params:
+                if params[key].shape != frozen[key].shape:
+                    raise ValueError(f"Frozen initial model shape mismatch: {key}")
+            return {key: value.detach().cpu().clone() for key, value in frozen.items()}
+        return params
+
+    def save_experiment_inputs(self, initial_params) -> None:
+        node_resources = [
+            {
+                "node_id": client_id,
+                "step_delay_ms": self.client_step_delays_ms[client_id],
+                "slow_network": client_id in self.slow_network_client_ids,
+                "low_storage": client_id in self.low_storage_client_ids,
+            }
+            for client_id in range(self.cfg.num_clients)
+        ]
+        link_profiles = {
+            "default": {
+                "bandwidth_mbps": self.cfg.link_bandwidth_mbps,
+                "latency_ms": self.cfg.link_latency_ms,
+                "drop_rate": self.cfg.link_drop_rate,
+            },
+            "edge_overrides": self.edge_overrides,
+        }
+        write_experiment_inputs(
+            output_dir=self.cfg.output_dir,
+            config=self.cfg,
+            client_indices=self.client_indices,
+            initial_model=initial_params,
+            physical_graph=self.physical_graph_input or self.neighbors,
+            node_resources=self.node_resources_input,
+            link_profiles=(self.frozen_inputs["link_profiles.json"]
+                           if self.frozen_inputs else link_profiles),
+            failure_trace=self._experiment_failure_trace(),
+            partition_metadata=getattr(self, "har_partition_metadata", {
+                "dataset": self.cfg.dataset,
+                "split_policy": resolve_dataset_split_policy(
+                    self.cfg.dataset, getattr(self.cfg, "dataset_split_policy", None)
+                ),
+            }),
+        )
+
+    def _experiment_failure_trace(self):
+        if self.frozen_inputs:
+            return self.frozen_inputs["failure_trace.json"]
+        has_explicit_dynamic_trace = bool(
+            self.cfg.dynamic_failure_trace_json
+            or self.cfg.dynamic_initial_inactive_nodes
+        )
+        if (self.cfg.algorithm == "dynamic_dpsgd" or
+                (self.cfg.algorithm == "epidemic_learning" and
+                 has_explicit_dynamic_trace)):
+            raw = (json.loads(self.cfg.dynamic_failure_trace_json)
+                   if self.cfg.dynamic_failure_trace_json else {})
+            trace = dict(raw) if isinstance(raw, dict) else {"events": raw}
+            trace.setdefault("events", [])
+            if self.cfg.dynamic_initial_inactive_nodes:
+                trace["initial_inactive_nodes"] = json.loads(
+                    self.cfg.dynamic_initial_inactive_nodes
+                )
+            return trace
+        return {
+            "mode": "stochastic_client_dropout",
+            "client_drop_rate": self.cfg.client_drop_rate,
+            "seed": self.cfg.seed,
+        }
+
+    def save_completion_status(self, status: str, error: str | None = None) -> None:
+        completed_rounds = len(self.monitor.round_metrics)
+        if status == "COMPLETE" and completed_rounds != self.cfg.rounds:
+            status = "INCOMPLETE"
+        write_completion_status(
+            self.cfg.output_dir,
+            requested_rounds=self.cfg.rounds,
+            completed_rounds=completed_rounds,
+            status=status,
+            error=error,
+        )
 
     def _resolve_link_profile(self, kind: str) -> dict[str, float]:
+        if self.frozen_inputs:
+            frozen = self.frozen_inputs["link_profiles.json"]
+            default = frozen.get("default", frozen)
+            return {
+                "bandwidth_mbps": float(default.get(
+                    "bandwidth_mbps", default.get("default_bandwidth_mbps", self.cfg.link_bandwidth_mbps)
+                )),
+                "latency_ms": float(default.get(
+                    "latency_ms", default.get("default_latency_ms", self.cfg.link_latency_ms)
+                )),
+                "drop_rate": float(default.get("drop_rate", self.cfg.link_drop_rate)),
+            }
         if self.cfg.link_profile_mode != "role_aware":
             return {
                 "bandwidth_mbps": self.cfg.link_bandwidth_mbps,
@@ -663,9 +839,16 @@ class RayFLRuntime:
             retries_used=0,
             timeout_occurred=False,
             total_backoff_ms=0.0,
+            link_latency_ms=link_profile["latency_ms"],
         )
 
-    def _record_comm(self, round_id: int, src: str, dst: str, payload_bytes: int, kind: str) -> bool:
+    def _record_comm(self, round_id: int, src: str, dst: str, payload_bytes: int,
+                     kind: str, *, message_type: str | None = None,
+                     phase: str | None = None, flow_id: str | None = None,
+                     logical_parent_message_id: str | None = None,
+                     link_type: str | None = None,
+                     physical_hop_index: int = 1,
+                     physical_hop_count: int = 1) -> bool:
         base_profile = self._resolve_link_profile(kind)
         network_adjusted = self._apply_client_network_adjustments(base_profile, src, dst)
         link_profile = self._apply_edge_overrides(network_adjusted, src, dst)
@@ -718,6 +901,14 @@ class RayFLRuntime:
             retries_used=retries_used,
             timeout_occurred=timeout_occurred,
             total_backoff_ms=total_backoff_ms,
+            link_latency_ms=link_profile["latency_ms"],
+            message_type=message_type,
+            phase=phase,
+            flow_id=flow_id,
+            logical_parent_message_id=logical_parent_message_id,
+            link_type=link_type,
+            physical_hop_index=physical_hop_index,
+            physical_hop_count=physical_hop_count,
         )
         return delivered
 
@@ -733,7 +924,19 @@ class RayFLRuntime:
         random.shuffle(all_clients)
         return all_clients[:sample_count]
 
-    def inject_dropouts(self, selected_client_ids):
+    def inject_dropouts(self, selected_client_ids, round_id: int | None = None):
+        frozen = [] if round_id is None else frozen_failure_events(
+            self.frozen_inputs, round_id, "node_failure"
+        )
+        trace = self.frozen_inputs and self.frozen_inputs["failure_trace.json"]
+        has_explicit_trace = isinstance(trace, list) or (
+            isinstance(trace, dict) and "events" in trace
+        )
+        if has_explicit_trace:
+            failed_ids, _ = failure_state_at_round(self.frozen_inputs, int(round_id))
+            active = [node for node in selected_client_ids if node not in failed_ids]
+            dropped = [node for node in selected_client_ids if node in failed_ids]
+            return active, dropped
         active = []
         dropped = []
         for client_id in selected_client_ids:
@@ -747,12 +950,50 @@ class RayFLRuntime:
             active.append(recovered)
         return active, dropped
 
+    def record_frozen_topology_events(self, round_id: int) -> None:
+        """Record immutable failure/recovery events for non-dynamic baselines."""
+        for event_type in (
+            "node_failure", "node_recovery", "node_join",
+            "link_failure", "link_recovery",
+        ):
+            for event in frozen_failure_events(self.frozen_inputs, round_id, event_type):
+                if event_type.startswith("node_"):
+                    raw = event.get("node_ids", event.get("targets", event.get("target", [])))
+                    if not isinstance(raw, list):
+                        raw = [raw]
+                    targets = [int(node) for node in raw]
+                    target_type = "node"
+                    target_id = ",".join(str(node) for node in targets)
+                    affected = targets
+                else:
+                    raw = event.get("edges", event.get("targets", event.get("target", [])))
+                    if raw and isinstance(raw[0], int):
+                        raw = [raw]
+                    edges = [tuple(sorted((int(edge[0]), int(edge[1])))) for edge in raw]
+                    target_type = "link"
+                    target_id = ",".join(f"{left}-{right}" for left, right in edges)
+                    affected = sorted({node for edge in edges for node in edge})
+                self.monitor.record_topology_event(
+                    experiment_id=self.run_name, method=self.cfg.algorithm,
+                    seed=self.cfg.seed, round=round_id, event_type=event_type,
+                    target_type=target_type, target_id=target_id,
+                    affected_nodes=affected, old_state=None, new_state=None,
+                    control_messages=None, control_bytes=None,
+                    repair_time_wall_clock_seconds=0.0, source="failure_trace",
+                )
+
     def train_selected_clients(self, selected_client_ids, round_id: int):
         # 在训练前更新学习率（动态学习率调度）
         self.adjust_learning_rate(round_id)
         
-        refs = [self.clients[client_id].local_train.remote(round_id) for client_id in selected_client_ids]
-        return ray.get(refs)
+        results = []
+        limit = max(1, self.cfg.max_concurrent_gpu_clients)
+        for start in range(0, len(selected_client_ids), limit):
+            batch = selected_client_ids[start:start + limit]
+            refs = [self.clients[client_id].local_train.remote(round_id)
+                    for client_id in batch]
+            results.extend(ray.get(refs))
+        return results
     
     def adjust_learning_rate(self, round_id: int):
         """
@@ -769,13 +1010,14 @@ class RayFLRuntime:
         initial_lr = float(self.cfg.learning_rate)
         min_lr = float(self.cfg.learning_rate_min)
         warmup_rounds = int(self.cfg.warmup_rounds)
-        max_rounds = int(self.cfg.rounds)
+        schedule_rounds = int(self.cfg.learning_rate_schedule_rounds)
+        max_rounds = schedule_rounds if schedule_rounds > 0 else int(self.cfg.rounds)
         
         if self.cfg.cosine_annealing:
             # Warmup 阶段
             if round_id < warmup_rounds:
-                # 线性增长：lr = initial_lr * (round_id / warmup_rounds)
-                new_lr = initial_lr * (round_id / warmup_rounds)
+                # Round zero uses the first non-zero warmup step, matching DRIFT.
+                new_lr = initial_lr * ((round_id + 1) / max(1, warmup_rounds))
             else:
                 # Cosine Annealing 阶段
                 # 从 warmup_rounds 开始的进度：[0, max_rounds - warmup_rounds]
@@ -1055,6 +1297,91 @@ class RayFLRuntime:
         refs = [self.clients[client_id].upload_model.remote() for client_id in client_ids]
         return ray.get(refs)
 
+    def get_consensus_params(self, client_ids=None):
+        if client_ids is None:
+            client_ids = list(range(self.cfg.num_clients))
+        models = self.get_client_models(client_ids)
+        if not models:
+            raise RuntimeError("No client models available for consensus")
+        total = sum(int(item["num_examples"]) for item in models)
+        consensus = {}
+        for key in models[0]["params"]:
+            first = models[0]["params"][key]
+            if first.is_floating_point():
+                value = torch.zeros_like(first, dtype=torch.float64)
+                for item in models:
+                    value += item["params"][key].double() * int(item["num_examples"])
+                consensus[key] = (value / max(1, total)).to(first.dtype)
+            else:
+                consensus[key] = first.clone()
+        return consensus, models
+
+    def _evaluate_params_without_mutation(self, params):
+        with torch.random.fork_rng(devices=[]):
+            if self.cfg.dataset in ('cifar10', 'neu', 'cifar100'):
+                if self.cfg.model == 'resnet18':
+                    from .actors import ResNet18
+                    model = ResNet18(self.cfg.num_classes)
+                else:
+                    from .actors import CNN
+                    model = CNN(self.cfg.num_classes)
+            elif self.cfg.dataset == 'har':
+                from .actors import HARMLP
+                model = HARMLP(self.cfg.input_dim, self.cfg.num_classes)
+            else:
+                model = MLP(self.cfg.input_dim, self.cfg.num_classes)
+        device = torch.device("cuda:0" if self.cfg.use_gpu and torch.cuda.is_available() else "cpu")
+        model.load_state_dict(params)
+        model.to(device).eval()
+        loader = DataLoader(TensorDataset(self.val_x, self.val_y),
+                            batch_size=max(1, self.cfg.batch_size), shuffle=False)
+        criterion = nn.CrossEntropyLoss()
+        loss_sum = 0.0
+        correct = total = 0
+        with torch.no_grad():
+            for features, labels in loader:
+                features, labels = features.to(device), labels.to(device)
+                logits = model(features)
+                loss_sum += criterion(logits, labels).item() * labels.size(0)
+                correct += (logits.argmax(dim=1) == labels).sum().item()
+                total += labels.size(0)
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return loss_sum / max(1, total), correct / max(1, total)
+
+    def evaluate_decentralized(self, client_ids=None, include_local=True):
+        consensus, models = self.get_consensus_params(client_ids)
+        loss, accuracy = self._evaluate_params_without_mutation(consensus)
+        squared_sum = 0.0
+        element_count = 0
+        for item in models:
+            for key, center in consensus.items():
+                if center.is_floating_point():
+                    delta = item["params"][key].double() - center.double()
+                    squared_sum += delta.square().sum().item()
+                    element_count += delta.numel()
+        diagnostics = {
+            "consensus_loss": loss,
+            "consensus_accuracy": accuracy,
+            "consensus_error": (squared_sum / max(1, element_count)) ** 0.5,
+            "mean_local_accuracy": None,
+            "worst_local_accuracy": None,
+        }
+        if include_local:
+            ids = client_ids or list(range(self.cfg.num_clients))
+            local_results = []
+            limit = max(1, self.cfg.max_concurrent_gpu_clients)
+            for start in range(0, len(ids), limit):
+                local_results.extend(ray.get([
+                    self.clients[cid].evaluate.remote(self.val_x, self.val_y)
+                    for cid in ids[start:start + limit]
+                ]))
+            local_acc = [item[1] for item in local_results]
+            diagnostics["mean_local_accuracy"] = sum(local_acc) / max(1, len(local_acc))
+            diagnostics["worst_local_accuracy"] = min(local_acc, default=None)
+        return consensus, diagnostics
+
     def evaluate_global(self, params=None):
         """Evaluate global model.
         
@@ -1065,37 +1392,9 @@ class RayFLRuntime:
         if not self.clients:
             return 0.0, 0.0
         
-        # If params is provided, use it directly
-        if params is not None:
-            eval_params = params
-        else:
-            # Get models from all clients and aggregate
-            model_refs = [client.upload_model.remote() for client in self.clients]
-            models = ray.get(model_refs)
-            
-            if not models:
-                return 0.0, 0.0
-            
-            # Aggregate models (equal-weight averaging)
-            aggregated_params = None
-            for model_data in models:
-                client_params = model_data["params"]
-                if aggregated_params is None:
-                    aggregated_params = {k: v.clone() for k, v in client_params.items()}
-                else:
-                    for k in aggregated_params:
-                        aggregated_params[k] += client_params[k]
-            
-            # Average the aggregated parameters
-            for k in aggregated_params:
-                aggregated_params[k] = aggregated_params[k].float() / len(models)
-            
-            eval_params = aggregated_params
-        
-        # Use first client for evaluation
-        ray.get(self.clients[0].receive_model.remote(eval_params))
-        eval_loss, eval_acc = ray.get(self.clients[0].evaluate.remote(self.val_x, self.val_y))
-        return eval_loss, eval_acc
+        if params is None:
+            params, _ = self.get_consensus_params()
+        return self._evaluate_params_without_mutation(params)
 
     def save_final_model(self, params) -> str:
         out_dir = Path(self.cfg.output_dir)

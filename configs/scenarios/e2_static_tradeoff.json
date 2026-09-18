@@ -1,0 +1,22 @@
+{
+  "name": "e2_static_tradeoff",
+  "purpose": "Representative static edge setting with moderate compute and network heterogeneity.",
+  "resource_profile": {
+    "mode": "tiers",
+    "reference_cpu_cores": 16,
+    "tiers": [
+      {"name": "slow", "fraction": 0.2, "capacity": 0.2},
+      {"name": "medium", "fraction": 0.6, "capacity": 0.5},
+      {"name": "fast", "fraction": 0.2, "capacity": 1.0}
+    ]
+  },
+  "network_profile": {
+    "mode": "medium_heterogeneous",
+    "default_bandwidth_mbps": 100.0,
+    "default_latency_ms": 5.0,
+    "slow_edge_fraction": 0.2,
+    "slow_bandwidth_mbps": 20.0,
+    "slow_latency_ms": 20.0
+  },
+  "failure_profile": {"mode": "none"}
+}

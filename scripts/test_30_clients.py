@@ -9,7 +9,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from deasfl import NewFLConfig, NewFLRuntime
-from deasfl.runtime import load_cifar10_data, load_cifar100_data, load_neu_data, load_har_data
+from deasfl.runtime import (
+    load_cifar10_data, load_cifar100_data, load_neu_data, load_har_data,
+    resolve_dataset_split_policy,
+)
 import torch
 import time
 import numpy as np
@@ -243,7 +246,8 @@ def validate_hierarchical_structure(clustering_result, max_child):
     }
 
 
-def test_30_clients(config_path: str = None):
+def test_30_clients(config_path: str = None, rounds_override: int = None,
+                    frozen_inputs_dir: str = None, data_dir_override: str = None):
     """测试联邦学习训练功能
     
     Args:
@@ -260,6 +264,14 @@ def test_30_clients(config_path: str = None):
         else:
             cfg = NewFLConfig()
             print(f"\n使用默认配置")
+        if rounds_override is not None:
+            if rounds_override <= 0:
+                raise ValueError("--rounds must be positive")
+            cfg.rounds = rounds_override
+        if frozen_inputs_dir is not None:
+            cfg.frozen_inputs_dir = frozen_inputs_dir
+        if data_dir_override is not None:
+            cfg.data_dir = data_dir_override
 
         print(f"\n{'='*60}")
         print("配置信息:")
@@ -298,7 +310,12 @@ def test_30_clients(config_path: str = None):
                 data_dir=cfg.data_dir,
                 num_clients=cfg.num_clients,
                 partition_mode=cfg.partition,
-                alpha=cfg.alpha
+                alpha=cfg.alpha,
+                seed=cfg.seed,
+                client_indices=(runtime.frozen_inputs["data_partition.json"]["client_indices"]
+                                if runtime.frozen_inputs else None),
+                split_policy=resolve_dataset_split_policy(cfg.dataset, cfg.dataset_split_policy),
+                local_val_seed=cfg.har_local_val_seed,
             )
         elif cfg.dataset == 'cifar100':
             print(f"\n加载 CIFAR-100 数据集（{cfg.num_clients} 客户端）...")
@@ -310,11 +327,30 @@ def test_30_clients(config_path: str = None):
             )
         else:
             print(f"\n加载 CIFAR-10 数据集...")
+            frozen_partition = (
+                runtime.frozen_inputs["data_partition.json"]
+                if runtime.frozen_inputs else {}
+            )
+            test_partition_mode = getattr(
+                cfg, "client_test_partition_mode", "global_balanced"
+            )
+            client_test_indices = frozen_partition.get("client_test_indices")
+            if (test_partition_mode == "match_train_distribution"
+                    and client_test_indices is None):
+                raise ValueError(
+                    "match_train_distribution requires frozen client_test_indices"
+                )
             train_data, val_data, indices, global_test_data, label_distributions = load_cifar10_data(
                 data_dir=cfg.data_dir,
                 num_clients=cfg.num_clients,
                 partition_mode=cfg.partition,
-                alpha=cfg.alpha
+                alpha=cfg.alpha,
+                seed=cfg.seed,
+                client_indices=(frozen_partition.get("client_indices") or None),
+                client_test_indices=(
+                    client_test_indices
+                    if test_partition_mode == "match_train_distribution" else None
+                ),
             )
         print(f"数据加载完成！")
         print(f"  训练样本数: {sum(len(d['images']) for d in train_data)}")
@@ -403,13 +439,14 @@ def test_30_clients(config_path: str = None):
 
         # 创建 Ray Actor 客户端（启用分布式并行训练）
         print("创建 Ray 并行训练客户端...")
-        runtime._init_ray_actors(train_data, val_data)
+        runtime._init_ray_actors(train_data, val_data, global_test_data)
 
         # 运行训练
         training_results = runtime.run_training(num_rounds=cfg.rounds)
         
         # 验证训练效果
-        avg_acc = np.mean(training_results['final_client_accuracies'])
+        avg_acc = (training_results['global_accuracies'][-1]
+                   if training_results['global_accuracies'] else 0.0)
         if avg_acc > 0.7:
             print(f"\n🎉 训练成功！平均准确率达到 {avg_acc:.4f}")
         else:
@@ -456,8 +493,24 @@ def test_30_clients(config_path: str = None):
         import traceback
         traceback.print_exc()
         if 'runtime' in locals():
+            if getattr(runtime, "output_dir", None):
+                completed = 0
+                try:
+                    completed = len(getattr(runtime, "monitor", None).round_metrics)
+                except (AttributeError, TypeError):
+                    pass
+                runtime._save_completion_status(
+                    runtime.output_dir, cfg.rounds, completed,
+                    status="FAILED", error=repr(e),
+                )
             runtime.shutdown()
         sys.exit(1)
+
+
+# This is an executable experiment helper, not a pytest test case.  Keep the
+# historical function name for callers while preventing accidental 100-round
+# GPU launches during repository-wide test discovery.
+test_30_clients.__test__ = False
 
 
 if __name__ == "__main__":
@@ -468,7 +521,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='联邦学习训练')
     parser.add_argument('--config', type=str, default=None,
                        help='YAML配置文件路径，默认使用config_de_asfl.yaml')
+    parser.add_argument('--rounds', type=int, default=None,
+                       help='仅覆盖训练轮数（用于烟雾测试）')
+    parser.add_argument('--frozen-inputs-dir', type=str, default=None,
+                       help='共享冻结输入目录')
+    parser.add_argument('--data-dir', type=str, default=None,
+                       help='数据集根目录，覆盖配置文件中的 data_dir')
     args = parser.parse_args()
     
     config_path = args.config if args.config else 'config_de_asfl.yaml'
-    test_30_clients(config_path=config_path)
+    test_30_clients(config_path=config_path, rounds_override=args.rounds,
+                    frozen_inputs_dir=args.frozen_inputs_dir,
+                    data_dir_override=args.data_dir)

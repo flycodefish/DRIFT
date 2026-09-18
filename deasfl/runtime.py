@@ -10,9 +10,16 @@ from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 
 from fl_core.monitor import Monitor
+from fl_core.artifacts import (
+    failure_state_at_round, frozen_failure_events, generate_node_resources, load_frozen_inputs,
+    normalize_physical_graph, validate_frozen_inputs, write_completion_status,
+    write_experiment_inputs,
+)
+from fl_core.system_metrics import dump_system_metrics
 from fl_core.data_loader import (
     SimpleModel, CNNModel, HARMLP,
     load_cifar10_data, load_cifar100_data, load_neu_data, load_har_data,
+    resolve_dataset_split_policy,
 )
 
 try:
@@ -26,7 +33,7 @@ try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
-    from torch.utils.data import DataLoader, TensorDataset
+    from torch.utils.data import ConcatDataset, DataLoader, TensorDataset
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -34,6 +41,12 @@ except ImportError:
 import ray
 
 from .config import NewFLConfig
+from .aggregation import (
+    WeightedState,
+    finalize_weighted_state,
+    leaf_weighted_state,
+    merge_weighted_states,
+)
 
 
 def build_client_tree_mapping(clustering_result: Dict, num_clients: int) -> Dict[int, Dict]:
@@ -130,7 +143,12 @@ class CommStats:
 
     跟踪分层聚合过程中所有模型传输的消息数和字节数。
     """
-    def __init__(self):
+    def __init__(self, round_id: int = 0, bandwidth_mbps=None,
+                 latency_ms=None, drop_rate: float = 0.0):
+        self.round_id = round_id
+        self.bandwidth_mbps = bandwidth_mbps
+        self.latency_ms = latency_ms
+        self.drop_rate = drop_rate
         self.intra_cluster_msgs: int = 0       # 簇内树边上传（子→父）
         self.inter_cluster_forward_hops: int = 0  # 簇间转发跳数（簇首→最优节点）
         self.inter_cluster_return_hops: int = 0   # 簇间返回跳数（最优节点→簇首）
@@ -138,6 +156,31 @@ class CommStats:
         self.model_bytes: int = 0               # 单个模型大小（字节）
         self.flat_upload_msgs: int = 0           # 扁平聚合：上传消息数
         self.flat_download_msgs: int = 0         # 扁平聚合：下载消息数
+        self.events: list[dict] = []
+
+    def record_transfer(self, src: int, dst: int, message_type: str,
+                        payload_bytes: int, hop_index: int = 1,
+                        hop_count: int = 1, phase: str | None = None,
+                        flow_id: str | None = None,
+                        logical_parent_message_id: str | None = None) -> None:
+        """Record one logical hop without changing legacy counters."""
+        self.events.append({
+            "round": self.round_id, "src": src, "dst": dst,
+            "message_type": message_type, "payload_bytes": payload_bytes,
+            "bandwidth_mbps": self.bandwidth_mbps,
+            "latency_ms": self.latency_ms, "drop_rate": self.drop_rate,
+            "phase": phase or {
+                "AGGREGATED_MODEL": "INTRA_CLUSTER_UPLOAD",
+                "ROUTED_MODEL": "INTER_CLUSTER_UPLOAD",
+                "GLOBAL_MODEL": "MODEL_DISTRIBUTION",
+            }.get(message_type, "CONTROL"),
+            "flow_id": flow_id,
+            "logical_parent_message_id": logical_parent_message_id,
+            "link_type": "LOGICAL_SIMULATED", "success": True,
+            "physical_hop_index": hop_index,
+            "physical_hop_count": hop_count,
+            "attempt_count": 1, "backoff_ms": 0.0,
+        })
 
     @property
     def total_msgs(self) -> int:
@@ -234,6 +277,11 @@ def hierarchical_aggregate(models: List[nn.Module], tree_mapping: Dict[int, Dict
                 )
                 if comm is not None:
                     comm.intra_cluster_msgs += 1
+                    comm.record_transfer(
+                        child_id, node_id, "AGGREGATED_MODEL", comm.model_bytes,
+                        phase="INTRA_CLUSTER_UPLOAD",
+                        flow_id=f"cluster:{tree_mapping[node_id].get('cluster_id', node_id)}:up",
+                    )
 
         # 加入节点自身模型（故障节点跳过）
         if not node_in_skip and models[node_id] is not None:
@@ -278,6 +326,50 @@ def hierarchical_aggregate(models: List[nn.Module], tree_mapping: Dict[int, Dict
                 aggregated_models[node_id] = models[node_id].state_dict()
 
     return aggregated_models
+
+
+def hierarchical_weighted_reduce(models: List, tree_mapping: Dict[int, Dict],
+                                 cluster_heads: List[int],
+                                 skip_nodes: Optional[set] = None,
+                                 comm: Optional['CommStats'] = None,
+                                 ) -> Dict[int, Optional[WeightedState]]:
+    """Accumulate float64 weighted sums without intermediate normalization."""
+    if skip_nodes is None:
+        skip_nodes = set()
+    reduced = {}
+
+    def collect(node_id):
+        if node_id in reduced:
+            return reduced[node_id]
+        parts = []
+        for child_id in tree_mapping[node_id].get('children', []):
+            if child_id in skip_nodes:
+                continue
+            child = collect(child_id)
+            if child is not None:
+                parts.append(child)
+                if comm is not None:
+                    comm.intra_cluster_msgs += 1
+                    comm.record_transfer(
+                        child_id, node_id, "AGGREGATED_MODEL", comm.model_bytes,
+                        phase="INTRA_CLUSTER_UPLOAD",
+                        flow_id=f"cluster:{tree_mapping[node_id].get('cluster_id', node_id)}:up",
+                    )
+        if node_id not in skip_nodes and models[node_id] is not None:
+            count = tree_mapping[node_id].get('sample_count') or 1
+            parts.append(leaf_weighted_state(
+                models[node_id].state_dict(), count, torch.device('cpu')
+            ))
+        if not parts:
+            reduced[node_id] = None
+            return None
+        reduced[node_id] = merge_weighted_states(parts)
+        return reduced[node_id]
+
+    for head in cluster_heads:
+        if head not in skip_nodes:
+            collect(head)
+    return reduced
 
 
 def flat_aggregate(params_list: List[Dict[str, torch.Tensor]],
@@ -347,11 +439,52 @@ def distribute_models_to_cluster(aggregated_models: Dict[int, Dict],
                     # 统计：父节点→子节点的一次模型分发
                     if comm is not None:
                         comm.intra_cluster_dist_msgs += 1
+                        comm.record_transfer(
+                            node_id, child_id, "GLOBAL_MODEL", comm.model_bytes,
+                            phase="INTRA_CLUSTER_DOWNLOAD",
+                            flow_id=f"cluster:{tree_mapping[node_id].get('cluster_id', node_id)}:down",
+                        )
                     distribute_recursive(child_id, aggregated_models[child_id])
 
     for cluster_head in cluster_heads:
         if cluster_head in aggregated_models:
             distribute_recursive(cluster_head, aggregated_models[cluster_head])
+
+
+def distribute_returned_models_to_clusters(returned_models: Dict[int, Dict],
+                                           tree_mapping: Dict[int, Dict],
+                                           models: List,
+                                           cluster_heads: List[int],
+                                           skip_nodes: Optional[set] = None,
+                                           comm: Optional['CommStats'] = None,
+                                           allow_unreachable: bool = False) -> None:
+    """Consume the GEA return result and broadcast it down each original cluster tree."""
+    skip_nodes = skip_nodes or set()
+
+    def distribute_recursive(node_id: int, model_state: Dict) -> None:
+        if node_id in skip_nodes or models[node_id] is None:
+            return
+        models[node_id].load_state_dict(model_state)
+        for child_id in sorted(tree_mapping[node_id]['children']):
+            if child_id in skip_nodes:
+                continue
+            if tree_mapping[child_id]['cluster_id'] != tree_mapping[node_id]['cluster_id']:
+                continue
+            if comm is not None:
+                comm.intra_cluster_dist_msgs += 1
+                comm.record_transfer(
+                    node_id, child_id, "GLOBAL_MODEL", comm.model_bytes,
+                    phase="INTRA_CLUSTER_DOWNLOAD",
+                    flow_id=f"cluster:{tree_mapping[node_id].get('cluster_id', node_id)}:down",
+                )
+            distribute_recursive(child_id, model_state)
+
+    for head_id in cluster_heads:
+        if head_id not in returned_models:
+            if allow_unreachable:
+                continue
+            raise RuntimeError(f"Cluster head {head_id} did not receive the global model")
+        distribute_recursive(head_id, returned_models[head_id])
 
 
 # ==============================================================================
@@ -366,8 +499,7 @@ from copy import deepcopy
 class ModelForwardMessage:
     """模型转发消息"""
     source_id: int                  # 源节点（簇首）
-    model_dict: Dict                # 模型参数
-    client_count: int               # 该模型代表的客户端数量
+    weighted_state: WeightedState   # float64 加权和 + 真实样本数
     path_stack: List[int]           # 转发路径栈（用于原路返回）
 
 
@@ -383,7 +515,7 @@ def build_cluster_info(tree_mapping: Dict[int, Dict],
         election_result: 选举结果
     
     Returns:
-        cluster_sizes: {cluster_head_id: client_count}
+        cluster_sizes: {cluster_head_id: total_sample_count}
         routing_tables: {node_id: {'next_hop': int, 'is_best_client': bool}}
     """
     cluster_sizes = {}
@@ -406,8 +538,7 @@ def build_cluster_info(tree_mapping: Dict[int, Dict],
 
 
 def forward_model_to_best_client(source_cluster_head: int,
-                                 model_dict: Dict,
-                                 client_count: int,
+                                 weighted_state: WeightedState,
                                  routing_tables: Dict[int, Dict],
                                  best_client_id: int,
                                  message_queue: Dict[int, List],
@@ -417,8 +548,7 @@ def forward_model_to_best_client(source_cluster_head: int,
 
     Args:
         source_cluster_head: 源簇首ID
-        model_dict: 模型参数
-        client_count: 该模型代表的客户端数量
+        weighted_state: 该簇未归一化的加权和与样本数
         routing_tables: 路由表
         best_client_id: 最佳客户端ID
         message_queue: 消息队列，用于模拟转发过程
@@ -454,18 +584,37 @@ def forward_model_to_best_client(source_cluster_head: int,
     if path_stack[-1] != best_client_id:
         print(f"  ⚠ 簇首 {source_cluster_head} 未能到达最佳客户端 {best_client_id}，"
               f"路径终止于 {path_stack[-1]}（hops={len(path_stack)-1}）")
+        # A disconnected cluster must not be included in the GEA aggregate.
+        # Logging a warning and still enqueueing it would make link failures
+        # cosmetic rather than changing reachability.
+        return
 
     # 统计：路径上除源节点外的每一跳都是一次模型转发
     hops = len(path_stack) - 1
     if comm is not None and hops > 0:
         comm.inter_cluster_forward_hops += hops
         if comm.model_bytes == 0:
-            comm.model_bytes = compute_model_bytes(model_dict)
+            # WeightedState is a high-precision numerical accumulator. The
+            # protocol still transmits one model payload per hop, so preserve
+            # float32 model-size accounting used by all communication results.
+            comm.model_bytes = compute_model_bytes(
+                finalize_weighted_state(weighted_state)
+            )
+        for hop_index, (src, dst) in enumerate(
+            zip(path_stack[:-1], path_stack[1:]), start=1
+        ):
+            comm.record_transfer(
+                src, dst,
+                "AGGREGATED_MODEL" if dst == best_client_id else "ROUTED_MODEL",
+                comm.model_bytes,
+                hop_index=hop_index, hop_count=hops,
+                phase="INTER_CLUSTER_UPLOAD",
+                flow_id=f"cluster:{source_cluster_head}:inter-up",
+            )
 
     msg = ModelForwardMessage(
         source_id=source_cluster_head,
-        model_dict=deepcopy(model_dict),
-        client_count=client_count,
+        weighted_state=deepcopy(weighted_state),
         path_stack=path_stack
     )
 
@@ -496,24 +645,14 @@ def aggregate_models_at_best_client(best_client_id: int,
     if not messages:
         return models[best_client_id].state_dict(), {}
     
-    client_counts = []
-    model_dicts = []
+    weighted_states = []
     path_stacks = {}
     
     for msg in messages:
-        client_counts.append(msg.client_count)
-        model_dicts.append(msg.model_dict)
+        weighted_states.append(msg.weighted_state)
         path_stacks[msg.source_id] = msg.path_stack
     
-    total_clients = sum(client_counts)
-    
-    final_model = {}
-    for key in model_dicts[0].keys():
-        weighted_sum = torch.zeros_like(model_dicts[0][key], dtype=torch.float32).to(device)
-        for i, model_dict in enumerate(model_dicts):
-            weight = client_counts[i] / total_clients
-            weighted_sum += model_dict[key].float() * weight
-        final_model[key] = weighted_sum
+    final_model = finalize_weighted_state(merge_weighted_states(weighted_states))
     
     return final_model, path_stacks
 
@@ -537,6 +676,15 @@ def return_model_to_cluster_heads(final_model: Dict,
         hops = len(reverse_path) - 1
         if comm is not None and hops > 0:
             comm.inter_cluster_return_hops += hops
+            for hop_index, (src, dst) in enumerate(
+                zip(reverse_path[:-1], reverse_path[1:]), start=1
+            ):
+                comm.record_transfer(
+                    src, dst, "GLOBAL_MODEL", comm.model_bytes,
+                    hop_index=hop_index, hop_count=hops,
+                    phase="INTER_CLUSTER_DOWNLOAD",
+                    flow_id=f"cluster:{source_head}:inter-down",
+                )
 
         return_msg = {
             'target_cluster_head': source_head,
@@ -585,6 +733,10 @@ class NewFLRuntime:
         self.train_loaders = None
         self.val_loaders = None
         self.device = None
+        self.global_test_data = None
+        self._initial_model_state = None
+        self.frozen_inputs = None
+        self.node_resources_input = None
 
         # 动态节点管理（Node Failure / Join）
         self.original_num_clients = self.config.num_clients
@@ -594,15 +746,43 @@ class NewFLRuntime:
         self.total_nodes = self.config.num_clients
         self.active_nodes: set = set(range(self.initial_active))
         self.failed_nodes: set = set()
+        self.failed_edges: set[tuple[int, int]] = set()
+        self._last_recovered_nodes: list[int] = []
+        self._last_link_state_changed = False
         self.joined_nodes: set = set()
         self.failure_log: list = []    # 每轮的故障记录
         self.join_log: list = []       # 每轮的加入记录
         
     def start(self):
         """启动运行时"""
+        if self.config.use_gpu and not torch.cuda.is_available():
+            raise RuntimeError("GPU execution requested but CUDA is unavailable")
         random.seed(self.config.seed)
         np.random.seed(self.config.seed)
         torch.manual_seed(self.config.seed)
+        if self.config.frozen_inputs_dir:
+            self.frozen_inputs = load_frozen_inputs(self.config.frozen_inputs_dir)
+            expected_fingerprint = None
+            if self.config.dataset == "har":
+                from fl_core.data_loader import har_dataset_fingerprint
+                expected_fingerprint = har_dataset_fingerprint(self.config.data_dir)
+            expected_split_policy = resolve_dataset_split_policy(
+                self.config.dataset, getattr(self.config, "dataset_split_policy", None)
+            )
+            validate_frozen_inputs(
+                self.frozen_inputs,
+                self.config.num_clients,
+                expected_dataset=self.config.dataset,
+                expected_split_policy=expected_split_policy,
+                expected_local_val_seed=(getattr(self.config, "har_local_val_seed", None)
+                                         if self.config.dataset == "har" else None),
+                expected_dataset_fingerprint=expected_fingerprint,
+                strict=getattr(self.config, "strict_frozen_inputs", False),
+            )
+        self.node_resources_input = (
+            self.frozen_inputs["node_resources.json"] if self.frozen_inputs
+            else generate_node_resources(self.config.num_clients, self.config.seed)
+        )
         ray.init(ignore_reinit_error=True, logging_level="ERROR")
         print(f"NewFL Runtime started with seed: {self.config.seed}")
 
@@ -632,16 +812,39 @@ class NewFLRuntime:
             self.clients.append(client_info)
         self.client_sample_counts = [len(train_data[i]['labels']) for i in range(self.config.num_clients)]
         print(f"Initialized {len(self.clients)} clients")
+
+    def set_global_test_data(self, global_test_data) -> None:
+        """Register the shared test set used for the sole formal evaluation."""
+        if (self.frozen_inputs and getattr(self.config, "strict_frozen_inputs", False)
+                and self.config.dataset == "har"):
+            from fl_core.data_loader import tensor_fingerprint
+            expected = self.frozen_inputs["data_partition.json"].get("global_test_fingerprint")
+            actual = tensor_fingerprint(global_test_data["images"], global_test_data["labels"])
+            if expected != actual:
+                raise ValueError("Frozen HAR global test fingerprint does not match loaded data")
+        self.global_test_data = global_test_data
     
     def build_topology(self):
         """构建网络拓扑"""
-        self.topology = self._build_topology(
+        if self.frozen_inputs:
+            graph = self.frozen_inputs["physical_graph.json"]
+            if isinstance(graph, dict):
+                self.topology = [list(graph[str(i)] if str(i) in graph else graph[i])
+                                 for i in range(self.config.num_clients)]
+            else:
+                self.topology = [list(neighbors) for neighbors in graph]
+        else:
+            self.topology = self._build_topology(
             self.config.num_clients,
             self.config.topology_type,
             self.config.neighbor_selection,
             self.config.min_neighbors,
             self.config.max_neighbors
         )
+        normalized = normalize_physical_graph(
+            self.topology, self.config.num_clients
+        )
+        self.topology = [normalized[node] for node in range(self.config.num_clients)]
         print(f"Topology built: {self.config.topology_type}")
         return self.topology
     
@@ -833,12 +1036,32 @@ class NewFLRuntime:
             clients=clients,
             topology=filtered_topology,
             base_trigger_time=self.config.election_base_trigger_time,
-            trigger_factor=self.config.election_trigger_factor
+            trigger_factor=self.config.election_trigger_factor,
+            seed=self.config.seed,
+            resource_params=self._frozen_election_resources(),
         )
         
         # 运行选举
         self.election_results = election_manager.start_election()
         return self.election_results
+
+    def _frozen_election_resources(self):
+        if not self.node_resources_input:
+            return None
+        resources = self.node_resources_input
+        if not isinstance(resources, list) or not resources:
+            return None
+        normalized = []
+        for item in resources:
+            params = item.get("resource_params", item)
+            required = {"cpu_cores", "memory_gb", "bandwidth_mbps", "gpu_memory_gb"}
+            if not required.issubset(params):
+                return None
+            value = {key: params[key] for key in required}
+            if not self.config.resource_awareness:
+                value["resource_score_override"] = 1.0
+            normalized.append(value)
+        return normalized
     
     def init_clustering(self, election_results: Dict, max_child: int, cluster_offset: float):
         """初始化聚类"""
@@ -847,6 +1070,9 @@ class NewFLRuntime:
     def run_clustering(self):
         """运行聚类算法"""
         from .election import ClusteringManager
+        from .cluster_assignments import (
+            EXPERIMENTAL_MODES, build_matched_clustering_result,
+        )
 
         # 创建虚拟客户端列表（仅包含活跃节点）
         clients = [{'id': i} for i in sorted(self.active_nodes)]
@@ -878,7 +1104,31 @@ class NewFLRuntime:
         )
         
         # 运行聚类
-        self.clustering_results = clustering_manager.run_clustering()
+        reference_result = clustering_manager.run_clustering()
+        assignment_mode = getattr(
+            self.config, "clustering_assignment_mode", "distributed"
+        )
+        if assignment_mode == "distributed":
+            self.clustering_results = reference_result
+        elif assignment_mode in EXPERIMENTAL_MODES:
+            if label_dists is None or len(label_dists) != self.config.num_clients:
+                raise RuntimeError(
+                    f"{assignment_mode} requires one training-label distribution per client"
+                )
+            print("\n" + "!" * 72)
+            print(f"EXPERIMENT ONLY: centralized cluster assignment mode={assignment_mode}")
+            print("This mode is not part of the deployable distributed DRIFT protocol.")
+            print("!" * 72)
+            self.clustering_results = build_matched_clustering_result(
+                reference_result=reference_result,
+                label_distributions=label_dists,
+                election_results=self.election_results,
+                max_child=self.config.cluster_max_child,
+                mode=assignment_mode,
+                seed=self.config.seed,
+            )
+        else:
+            raise ValueError(f"Unknown clustering_assignment_mode: {assignment_mode}")
         self.tree_mapping = build_client_tree_mapping(self.clustering_results, self.config.num_clients)
         return self.clustering_results
 
@@ -892,6 +1142,13 @@ class NewFLRuntime:
         """
         self.clustering_results = clustering_results
         self.tree_mapping = build_client_tree_mapping(clustering_results, self.config.num_clients)
+
+        if hasattr(self, 'client_sample_counts'):
+            set_tree_sample_counts(
+                self.tree_mapping,
+                self.client_sample_counts,
+                clustering_results.get('cluster_heads', []),
+            )
 
         if election_results is not None:
             self.election_results = election_results
@@ -969,7 +1226,10 @@ class NewFLRuntime:
         elif model_name in ('cnn', 'cnnmodel'):
             return CNNModel(num_classes=self.config.num_classes)
         elif model_name == 'harmlp':
-            return HARMLP(num_classes=self.config.num_classes)
+            return HARMLP(
+                input_dim=getattr(self.config, 'input_dim', 561),
+                num_classes=self.config.num_classes,
+            )
         else:
             return SimpleModel(input_dim=10, num_classes=self.config.num_classes)
 
@@ -978,7 +1238,8 @@ class NewFLRuntime:
         initial_lr = float(self.config.learning_rate)
         min_lr = float(self.config.learning_rate_min)
         warmup = int(self.config.warmup_rounds)
-        max_rounds = int(self.config.rounds)
+        schedule_rounds = int(self.config.learning_rate_schedule_rounds)
+        max_rounds = schedule_rounds if schedule_rounds > 0 else int(self.config.rounds)
 
         if self.config.cosine_annealing:
             if round_id < warmup:
@@ -990,16 +1251,30 @@ class NewFLRuntime:
         else:
             return max(initial_lr * (0.95 ** round_id), min_lr)
 
-    def _init_ray_actors(self, train_data, val_data):
+    def _init_ray_actors(self, train_data, val_data, global_test_data=None):
         """创建 NewClientActor 的 Ray 实例，平分到多 GPU 上"""
         from .actors import NewClientActor
 
         num_gpus = torch.cuda.device_count()
-        self.device = torch.device("cuda:0" if num_gpus > 0 else "cpu")
+        self.device = torch.device(
+            "cuda:0" if self.config.use_gpu and num_gpus > 0 else "cpu"
+        )
 
         # 所有客户端共享同一个初始模型（对齐 FedAvg）
+        torch.manual_seed(self.config.seed)
         base_model = self._create_model()
         base_state = {k: v.cpu().clone() for k, v in base_model.state_dict().items()}
+        if self.frozen_inputs:
+            frozen = self.frozen_inputs["initial_model.pt"]
+            if base_state.keys() != frozen.keys():
+                raise ValueError("Frozen initial model is incompatible with configured model")
+            for key in base_state:
+                if base_state[key].shape != frozen[key].shape:
+                    raise ValueError(f"Frozen initial model shape mismatch: {key}")
+            base_state = {key: value.detach().cpu().clone() for key, value in frozen.items()}
+        self._initial_model_state = base_state
+        if global_test_data is not None:
+            self.set_global_test_data(global_test_data)
 
         self.client_actors = [None] * self.config.num_clients
         for client_id in range(self.config.num_clients):
@@ -1018,7 +1293,8 @@ class NewFLRuntime:
             neighbors = list(self.topology[client_id]) if self.topology else []
 
             use_img_xf = self.config.dataset not in ('har',)
-            actor = NewClientActor.remote(
+            actor_gpu = self.config.num_gpus if self.config.use_gpu else 0.0
+            actor = NewClientActor.options(num_gpus=actor_gpu).remote(
                 client_id=client_id,
                 model=model,
                 train_dataset=train_ds,
@@ -1028,7 +1304,10 @@ class NewFLRuntime:
                 weight_decay=self.config.weight_decay,
                 device=None,
                 neighbors=neighbors,
-                use_image_transform=use_img_xf
+                use_image_transform=use_img_xf,
+                seed=self.config.seed + client_id,
+                deterministic_training=self.config.deterministic_training,
+                merge_singleton_batch=(self.config.dataset == "har"),
             )
             actor.set_local_epochs.remote(self.config.local_epochs)
             self.client_actors[client_id] = actor
@@ -1036,6 +1315,11 @@ class NewFLRuntime:
         # 存储每个客户端的样本数（用于样本加权聚合）
         self.client_sample_counts = [len(train_data[i]['labels'])
                                      for i in range(self.config.num_clients)]
+        set_tree_sample_counts(
+            self.tree_mapping,
+            self.client_sample_counts,
+            self.clustering_results.get('cluster_heads', []),
+        )
 
         # 保存训练数据引用（供后续 join 时创建新 actor 使用）
         self._reserve_train_data = train_data
@@ -1044,6 +1328,329 @@ class NewFLRuntime:
         active_count = sum(1 for a in self.client_actors if a is not None)
         print(f"Initialized {active_count} Ray client actors "
               f"across {num_gpus} GPU(s) (explicit round-robin assignment)")
+
+    def _evaluate_global_params(self, params: Dict[str, torch.Tensor]) -> tuple:
+        """Evaluate one global state once on the complete shared test set."""
+        if self.global_test_data is None:
+            raise RuntimeError("Global test data is not initialized")
+
+        device = torch.device(
+            "cuda:0" if self.config.use_gpu and torch.cuda.is_available() else "cpu"
+        )
+        with torch.random.fork_rng(devices=[]):
+            model = self._create_model()
+        model.load_state_dict(params)
+        model = model.to(device)
+        model.eval()
+        loader = DataLoader(
+            TensorDataset(
+                self.global_test_data['images'],
+                self.global_test_data['labels'],
+            ),
+            batch_size=max(1, self.config.batch_size),
+            shuffle=False,
+        )
+        criterion = nn.CrossEntropyLoss()
+        loss_sum = 0.0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for xb, yb in loader:
+                xb, yb = xb.to(device), yb.to(device)
+                logits = model(xb)
+                loss_sum += criterion(logits, yb).item() * yb.size(0)
+                correct += (logits.argmax(dim=1) == yb).sum().item()
+                total += yb.size(0)
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return loss_sum / max(1, total), correct / max(1, total)
+
+    def _evaluate_params_on_dataset(self, params: Dict[str, torch.Tensor], dataset) -> tuple:
+        """Evaluate an intermediate state without mutating any client actor."""
+        device = torch.device(
+            "cuda:0" if self.config.use_gpu and torch.cuda.is_available() else "cpu"
+        )
+        with torch.random.fork_rng(devices=[]):
+            model = self._create_model()
+        model.load_state_dict(params)
+        model = model.to(device)
+        model.eval()
+        loader = DataLoader(
+            dataset, batch_size=max(1, self.config.batch_size), shuffle=False
+        )
+        criterion = nn.CrossEntropyLoss()
+        loss_sum = 0.0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for xb, yb in loader:
+                xb, yb = xb.to(device), yb.to(device)
+                logits = model(xb)
+                loss_sum += criterion(logits, yb).item() * yb.size(0)
+                correct += (logits.argmax(dim=1) == yb).sum().item()
+                total += yb.size(0)
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return loss_sum / max(1, total), correct / max(1, total), total
+
+    def _cluster_members(self, head_id: int) -> list[int]:
+        """Return live members represented by one cluster tree."""
+        members = []
+
+        def visit(node_id: int) -> None:
+            if node_id in self.failed_nodes:
+                return
+            members.append(node_id)
+            for child_id in (self.tree_mapping or {}).get(node_id, {}).get("children", []):
+                visit(child_id)
+
+        visit(head_id)
+        return members
+
+    def _pairwise_label_jsd_stats(self, members: list[int]) -> tuple[float, int]:
+        """Natural-log JSD mean and number of real client pairs in one cluster."""
+        distributions = getattr(self, "label_distributions", None)
+        if distributions is None or len(members) < 2:
+            return 0.0, 0
+        values = []
+        epsilon = 1e-10
+        for left_index, left_id in enumerate(members):
+            p = np.asarray(distributions[left_id], dtype=np.float64) + epsilon
+            p /= p.sum()
+            for right_id in members[left_index + 1:]:
+                q = np.asarray(distributions[right_id], dtype=np.float64) + epsilon
+                q /= q.sum()
+                midpoint = (p + q) / 2.0
+                values.append(float(
+                    (np.sum(p * np.log(p / midpoint))
+                     + np.sum(q * np.log(q / midpoint))) / 2.0
+                ))
+        return (float(np.mean(values)), len(values)) if values else (0.0, 0)
+
+    def _mean_pairwise_label_jsd(self, members: list[int]) -> float:
+        """Compatibility helper returning only the pairwise JSD mean."""
+        return self._pairwise_label_jsd_stats(members)[0]
+
+    def _pooled_label_stats(self, members: list[int]) -> tuple[int, float, float]:
+        """Return class coverage, normalized entropy, and largest-class share."""
+        distributions = getattr(self, "label_distributions", None)
+        if distributions is None or not members:
+            return 0, 0.0, 0.0
+        pooled = np.zeros_like(np.asarray(distributions[members[0]], dtype=np.float64))
+        for node_id in members:
+            distribution = np.asarray(distributions[node_id], dtype=np.float64)
+            client = self.clients[node_id]
+            sample_count = len(
+                client.get("train_data", client.get("val_data", {"labels": [0]}))["labels"]
+            )
+            pooled += distribution * sample_count
+        total = float(pooled.sum())
+        if total <= 0:
+            return 0, 0.0, 0.0
+        probabilities = pooled / total
+        positive = probabilities[probabilities > 0]
+        entropy = float(-np.sum(positive * np.log(positive)))
+        normalized_entropy = entropy / math.log(len(probabilities)) if len(probabilities) > 1 else 0.0
+        return int(np.count_nonzero(pooled)), normalized_entropy, float(probabilities.max())
+
+    def _tree_edge_label_jsd_stats(self, head_id: int) -> tuple[float, int]:
+        """Mean label JSD over the actual parent-child edges of one cluster."""
+        distributions = getattr(self, "label_distributions", None)
+        if distributions is None:
+            return 0.0, 0
+        values = []
+        epsilon = 1e-10
+
+        def visit(parent_id: int) -> None:
+            p = np.asarray(distributions[parent_id], dtype=np.float64) + epsilon
+            p /= p.sum()
+            for child_id in (self.tree_mapping or {}).get(parent_id, {}).get("children", []):
+                if child_id in self.failed_nodes:
+                    continue
+                q = np.asarray(distributions[child_id], dtype=np.float64) + epsilon
+                q /= q.sum()
+                midpoint = (p + q) / 2.0
+                values.append(float(
+                    (np.sum(p * np.log(p / midpoint))
+                     + np.sum(q * np.log(q / midpoint))) / 2.0
+                ))
+                visit(child_id)
+
+        visit(head_id)
+        return (float(np.mean(values)), len(values)) if values else (0.0, 0)
+
+    def _evaluate_cluster_diagnostics(
+        self, round_id: int, cluster_heads: list[int],
+        aggregated_weighted: Dict[int, Optional[WeightedState]],
+    ) -> list[dict]:
+        """Evaluate CH models on cluster-local validation and optional global test data."""
+        if not self.config.enable_cluster_diagnostics:
+            return []
+        interval = max(1, int(self.config.cluster_diagnostics_interval))
+        is_final_round = round_id == int(self.config.rounds) - 1
+        if round_id % interval != 0 and not is_final_round:
+            return []
+
+        rows = []
+        global_dataset = None
+        if self.config.cluster_diagnostics_global_test:
+            if self.global_test_data is None:
+                raise RuntimeError("Global test data is required for cluster diagnostics")
+            global_dataset = TensorDataset(
+                self.global_test_data["images"], self.global_test_data["labels"]
+            )
+
+        for head_id in sorted(cluster_heads):
+            weighted_state = aggregated_weighted.get(head_id)
+            if weighted_state is None:
+                continue
+            members = self._cluster_members(head_id)
+            validation_sets = [
+                TensorDataset(
+                    self.clients[node_id]["val_data"]["images"],
+                    self.clients[node_id]["val_data"]["labels"],
+                )
+                for node_id in members
+                if len(self.clients[node_id]["val_data"]["labels"]) > 0
+            ]
+            if not validation_sets:
+                continue
+            params = finalize_weighted_state(weighted_state)
+            local_loss, local_acc, validation_samples = self._evaluate_params_on_dataset(
+                params, ConcatDataset(validation_sets)
+            )
+            global_loss = None
+            global_acc = None
+            if global_dataset is not None:
+                global_loss, global_acc, _ = self._evaluate_params_on_dataset(
+                    params, global_dataset
+                )
+            mean_jsd, label_pair_count = self._pairwise_label_jsd_stats(members)
+            tree_edge_jsd, tree_edge_count = self._tree_edge_label_jsd_stats(head_id)
+            label_coverage, label_entropy, largest_label_share = self._pooled_label_stats(members)
+            rows.append({
+                "round_id": round_id,
+                "cluster_head": head_id,
+                "member_ids": ",".join(str(node_id) for node_id in members),
+                "num_members": len(members),
+                "train_samples": weighted_state.sample_count,
+                "validation_samples": validation_samples,
+                "mean_pairwise_label_jsd": mean_jsd,
+                "label_pair_count": label_pair_count,
+                "mean_tree_edge_label_jsd": tree_edge_jsd,
+                "tree_edge_count": tree_edge_count,
+                "pooled_label_coverage": label_coverage,
+                "pooled_label_entropy": label_entropy,
+                "largest_pooled_label_share": largest_label_share,
+                "cluster_val_loss": local_loss,
+                "cluster_val_accuracy": local_acc,
+                "cluster_personalized_loss": (
+                    local_loss if getattr(
+                        self.config, "enable_cluster_personalized_evaluation", False
+                    ) else None
+                ),
+                "cluster_personalized_accuracy": (
+                    local_acc if getattr(
+                        self.config, "enable_cluster_personalized_evaluation", False
+                    ) else None
+                ),
+                "client_test_partition_mode": getattr(
+                    self.config, "client_test_partition_mode", "global_balanced"
+                ),
+                "cluster_global_loss": global_loss,
+                "cluster_global_accuracy": global_acc,
+                "final_global_loss": None,
+                "final_global_accuracy": None,
+                "distribution_similarity_threshold": (
+                    self.config.distribution_similarity_threshold
+                ),
+                "intra_cluster_rounds": int(
+                    getattr(self.config, "intra_cluster_rounds", 1)
+                ),
+                "clustering_assignment_mode": getattr(
+                    self.config, "clustering_assignment_mode", "distributed"
+                ),
+            })
+        return rows
+
+    def _save_experiment_inputs(self, output_dir: str) -> None:
+        if self._initial_model_state is None:
+            raise RuntimeError("Initial model state is unavailable")
+        client_indices = [client['indices'] for client in self.clients]
+        node_resources = (
+            self.election_results.get('all_nodes_info', [])
+            if self.election_results else []
+        )
+        partition_metadata = {
+            "dataset": self.config.dataset,
+            "split_policy": resolve_dataset_split_policy(
+                self.config.dataset, getattr(self.config, "dataset_split_policy", None)
+            ),
+            "local_val_seed": getattr(self.config, "har_local_val_seed", 42),
+        }
+        if self.config.dataset == "har":
+            from fl_core.data_loader import har_dataset_fingerprint, tensor_fingerprint
+            partition_count = sum(
+                len(client["train_data"]["labels"]) for client in self.clients
+            )
+            local_validation_count = sum(
+                len(item["labels"]) for item in getattr(self, "_reserve_val_data", [])
+            )
+            partition_metadata.update({
+                "partition_train_sample_count": partition_count,
+                "official_train_sample_count": partition_count + local_validation_count,
+                "local_validation_sample_count": local_validation_count,
+                "partition_index_space_size": partition_count,
+                "global_test_sample_count": (
+                    len(self.global_test_data["labels"])
+                    if self.global_test_data is not None else None
+                ),
+                "num_classes": self.config.num_classes,
+                "preprocessing": "official_train_mean_std_v1",
+                "dataset_fingerprint": har_dataset_fingerprint(self.config.data_dir),
+                "global_test_fingerprint": (
+                    tensor_fingerprint(
+                        self.global_test_data["images"], self.global_test_data["labels"]
+                    ) if self.global_test_data is not None else None
+                ),
+            })
+        write_experiment_inputs(
+            output_dir=output_dir,
+            config=self.config,
+            client_indices=client_indices,
+            initial_model=self._initial_model_state,
+            physical_graph=self.topology,
+            node_resources=self.node_resources_input,
+            link_profiles=(self.frozen_inputs["link_profiles.json"]
+                           if self.frozen_inputs else {
+                "bandwidth": self.config.bandwidth,
+                "latency": self.config.latency,
+                "drop_rate": self.config.drop_rate,
+            }),
+            failure_trace=(self.frozen_inputs["failure_trace.json"]
+                           if self.frozen_inputs else {
+                "mode": "stochastic_dynamic_nodes",
+                "enabled": self.config.enable_dynamic_nodes,
+                "failure_rate": self.config.failure_rate,
+                "failure_start_round": self.config.failure_start_round,
+                "failure_max_nodes": self.config.failure_max_nodes,
+                "failure_pattern": self.config.failure_pattern,
+                "seed": self.config.seed,
+            }),
+            partition_metadata=partition_metadata,
+        )
+
+    def _save_completion_status(
+        self, output_dir: str, requested_rounds: int,
+        completed_rounds: int, status: str, error: str | None = None,
+    ) -> None:
+        if status == "COMPLETE" and completed_rounds != requested_rounds:
+            status = "INCOMPLETE"
+        write_completion_status(
+            output_dir, requested_rounds, completed_rounds, status, error
+        )
 
     def _train_single_client(self, client_id: int, round_id: int) -> float:
         """
@@ -1080,70 +1687,6 @@ class NewFLRuntime:
         
         return total_loss / total_samples
     
-    def _evaluate_single_client(self, client_id: int) -> tuple:
-        """
-        评估单个客户端
-        
-        参数：
-            client_id: 客户端ID
-            
-        返回：
-            (验证损失, 准确率)
-        """
-        model = self.models[client_id]
-        criterion = self.criterions[client_id]
-        val_loader = self.val_loaders[client_id]
-        
-        model.eval()
-        total_loss = 0.0
-        correct = 0
-        total = 0
-        
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb, yb = xb.to(self.device), yb.to(self.device)
-                output = model(xb)
-                loss = criterion(output, yb)
-                
-                total_loss += loss.item() * xb.size(0)
-                _, predicted = torch.max(output.data, 1)
-                total += yb.size(0)
-                correct += (predicted == yb).sum().item()
-        
-        return total_loss / total, correct / total
-
-    def _evaluate_on_global_data(self, model: nn.Module) -> tuple:
-        """
-        在全局测试数据上评估模型
-
-        参数：
-            model: 要评估的模型
-
-        返回：
-            (验证损失, 准确率)
-        """
-        if self.global_test_loader is None:
-            return 0.0, 0.0
-
-        criterion = nn.CrossEntropyLoss()
-        model.eval()
-        total_loss = 0.0
-        correct = 0
-        total = 0
-
-        with torch.no_grad():
-            for xb, yb in self.global_test_loader:
-                xb, yb = xb.to(self.device), yb.to(self.device)
-                output = model(xb)
-                loss = criterion(output, yb)
-
-                total_loss += loss.item() * xb.size(0)
-                _, predicted = torch.max(output.data, 1)
-                total += yb.size(0)
-                correct += (predicted == yb).sum().item()
-
-        return total_loss / total if total > 0 else 0.0, correct / total if total > 0 else 0.0
-
     # ==========================================================================
     #                    动态节点管理（Node Failure / Join）
     # ==========================================================================
@@ -1152,6 +1695,39 @@ class NewFLRuntime:
         """模拟节点故障，返回本轮新故障的节点 ID 列表"""
         cfg = self.config
         newly_failed = []
+        self._last_recovered_nodes = []
+        self._last_link_state_changed = False
+
+        frozen = frozen_failure_events(self.frozen_inputs, round_id, "node_failure")
+        trace = self.frozen_inputs and self.frozen_inputs["failure_trace.json"]
+        has_explicit_trace = isinstance(trace, list) or (
+            isinstance(trace, dict) and "events" in trace
+        )
+        if has_explicit_trace:
+            target_failed, target_edges = failure_state_at_round(
+                self.frozen_inputs, round_id
+            )
+            previous_failed = set(self.failed_nodes)
+            previous_edges = set(self.failed_edges)
+            newly_failed = sorted(target_failed - previous_failed)
+            self._last_recovered_nodes = sorted(previous_failed - target_failed)
+            self._last_link_state_changed = target_edges != previous_edges
+            self.failed_nodes = set(target_failed)
+            self.failed_edges = set(target_edges)
+            if newly_failed:
+                self.failure_log.append({"round": round_id,
+                                         "failed_nodes": newly_failed.copy()})
+                self._repair_tree_after_failures(newly_failed)
+            if self._last_recovered_nodes:
+                for node in self._last_recovered_nodes:
+                    if hasattr(self, "client_sample_counts"):
+                        self.client_sample_counts[node] = len(self.clients[node]["indices"])
+                self.recovery_events.append({
+                    "event": "node_recovery", "round": round_id,
+                    "failed_nodes": self._last_recovered_nodes.copy(),
+                    "time_seconds": 0.0, "method": "failure_trace",
+                })
+            return newly_failed
 
         if not cfg.enable_dynamic_nodes:
             return newly_failed
@@ -1495,6 +2071,7 @@ class NewFLRuntime:
         pattern = self.config.failure_pattern if self.config.enable_dynamic_nodes else 'unknown'
         self.recovery_events.append({
             'event': 'tree_repair',
+            'round': getattr(self, '_current_round_id', None),
             'failure_pattern': pattern,
             'failed_nodes': list(failed_ids),
             'time_seconds': round(elapsed, 4),
@@ -1566,16 +2143,23 @@ class NewFLRuntime:
                 modified_topology.append([])
             else:
                 modified_topology.append([
-                    n for n in self.topology[i] if n not in excluded
+                    n for n in self.topology[i]
+                    if n not in excluded
+                    and tuple(sorted((i, n))) not in self.failed_edges
                 ])
 
         # 重新选举（仅活跃节点参与）
-        clients = [{'id': i} for i in sorted(self.active_nodes - self.failed_nodes)]
+        # Managers index clients, topology and resource tables by physical node
+        # id.  Preserve the full index space and isolate unavailable nodes in
+        # ``modified_topology``; compacting this list would renumber nodes.
+        clients = [{'id': i} for i in range(self.config.num_clients)]
         election_manager = ElectionManager(
             clients=clients,
             topology=modified_topology,
             base_trigger_time=self.config.election_base_trigger_time,
-            trigger_factor=self.config.election_trigger_factor
+            trigger_factor=self.config.election_trigger_factor,
+            seed=self.config.seed,
+            resource_params=self._frozen_election_resources(),
         )
         self.election_results = election_manager.start_election()
 
@@ -1630,6 +2214,7 @@ class NewFLRuntime:
         elapsed = time.time() - t0
         self.recovery_events.append({
             'event': 'reelect_recluster',
+            'round': getattr(self, '_current_round_id', None),
             'trigger': reason,
             'time_seconds': round(elapsed, 4),
             'election_hops': self.election_results.get('convergence_hops', -1),
@@ -1674,11 +2259,13 @@ class NewFLRuntime:
         results = {
             'round_accuracies': [],
             'round_losses': [],
+            'global_losses': [],
             'global_accuracies': [],
             'final_client_accuracies': [],
             'training_time': 0.0,
             'failure_log': [],      # 动态节点故障日志
             'join_log': [],         # 动态节点加入日志
+            'cluster_diagnostics': [],
         }
         self.recovery_events = []   # 恢复事件计时日志
         self._join_triggered = False  # 防止重复触发 join
@@ -1692,6 +2279,10 @@ class NewFLRuntime:
         os.makedirs(output_dir, exist_ok=True)
         self.output_dir = output_dir
         print(f"\n输出目录: {output_dir}")
+        self._save_experiment_inputs(output_dir)
+        self._save_completion_status(
+            output_dir, num_rounds, 0, status="RUNNING"
+        )
 
         # 动态节点模式：打印配置信息
         if self.config.enable_dynamic_nodes:
@@ -1700,14 +2291,23 @@ class NewFLRuntime:
             print(f"  最大故障节点: {self.config.failure_max_nodes}, 模式: {self.config.failure_pattern}")
             print(f"  恢复策略: {self.config.recovery_strategy}")
 
+        method_name = (self.config.method_name or
+                       ("drift" if self.config.resource_awareness
+                        else "drift_no_resource_awareness"))
         monitor = Monitor()
+        monitor.configure(run_name, method_name, self.config.seed)
+        unified_comm_events = []
 
         total_start_time = time.time()
+        latest_global_params = None
 
         for round_id in range(num_rounds):
+            self._current_round_id = round_id
             round_start_time = time.time()
             round_losses = []
-            round_accs = []
+            global_loss = None
+            global_acc = None
+            aggregated_nodes_this_round: set[int] = set()
 
             print(f"\n{'='*60}")
             print(f"第 {round_id + 1}/{num_rounds} 轮训练")
@@ -1721,6 +2321,32 @@ class NewFLRuntime:
 
             # ---- 动态节点管理 ----
             newly_failed = self._simulate_failures(round_id)
+            recovered_nodes = list(self._last_recovered_nodes)
+            link_state_changed = self._last_link_state_changed
+            if recovered_nodes:
+                print(f"\n✅ 节点恢复: {recovered_nodes}")
+                if use_ray and latest_global_params is not None:
+                    recovered_actors = [
+                        self.client_actors[node] for node in recovered_nodes
+                        if self.client_actors[node] is not None
+                    ]
+                    if recovered_actors:
+                        restored = {
+                            key: value.detach().cpu() for key, value in latest_global_params.items()
+                        }
+                        ray.get([
+                            actor.set_model_params.remote(restored)
+                            for actor in recovered_actors
+                        ])
+            if recovered_nodes or link_state_changed:
+                reason = "node_recovery" if recovered_nodes else "link_state_change"
+                if link_state_changed:
+                    print(f"\n⚠️  链路状态变化，当前故障链路: {sorted(self.failed_edges)}")
+                self._reelect_and_recluster(reason=reason)
+                if use_ray:
+                    live_actors, live_ids = self._get_live_ray_actors()
+                    new_lr = self._calc_learning_rate(round_id)
+                    ray.get([a.set_learning_rate.remote(new_lr) for a in live_actors])
             if newly_failed:
                 print(f"\n⚠️  节点故障: {newly_failed}")
                 print(f"  存活节点: {len(self.active_nodes - self.failed_nodes)}/{self.total_nodes}")
@@ -1730,8 +2356,17 @@ class NewFLRuntime:
                 # 更新 cluster_heads
                 self._update_cluster_heads_from_tree()
 
+                has_frozen_trace = bool(
+                    self.frozen_inputs
+                    and isinstance(self.frozen_inputs.get("failure_trace.json"), (list, dict))
+                )
+                if has_frozen_trace:
+                    self._reelect_and_recluster(reason="frozen_node_failure")
+                    if use_ray:
+                        live_actors, live_ids = self._get_live_ray_actors()
+
                 # reelect_recluster: 簇首故障时触发完整重新选举+聚类
-                if self.config.recovery_strategy == "reelect_recluster":
+                elif self.config.recovery_strategy == "reelect_recluster":
                     old_heads = set(self.clustering_results.get('cluster_heads', [])
                                     if self.clustering_results else [])
                     failed_heads = [n for n in newly_failed if n in old_heads]
@@ -1755,19 +2390,15 @@ class NewFLRuntime:
             print("\n[阶段1] 各客户端本地训练")
             if use_ray:
                 live_actors, live_ids = self._get_live_ray_actors()
-                train_results = ray.get([a.local_train.remote(round_id) for a in live_actors])
+                train_results = []
+                limit = max(1, self.config.max_concurrent_gpu_clients)
+                for start in range(0, len(live_actors), limit):
+                    batch = live_actors[start:start + limit]
+                    train_results.extend(ray.get([
+                        actor.local_train.remote(round_id) for actor in batch
+                    ]))
                 round_losses = [r['train_loss'] for r in train_results]
-
-                eval_results = ray.get([a.evaluate.remote() for a in live_actors])
-                round_accs = [r['val_acc'] for r in eval_results]
-
-                live_n = len(live_ids)
-                for i in range(0, live_n, 10):
-                    end = min(i + 10, live_n)
-                    cid_start = live_ids[i] if i < live_n else 0
-                    cid_end = live_ids[end - 1] if end <= live_n else live_ids[-1]
-                    print(f"  存活客户端 {i + 1}-{end} (ID {cid_start}-{cid_end}) 训练完成 - "
-                          f"平均准确率: {np.mean(round_accs[i:end]):.4f}")
+                print(f"  {len(live_ids)} 个存活客户端训练完成")
                 if self.failed_nodes:
                     print(f"  已故障节点（跳过）: {sorted(self.failed_nodes)}")
             else:
@@ -1775,15 +2406,24 @@ class NewFLRuntime:
                     if client_id in self.failed_nodes:
                         continue
                     loss = self._train_single_client(client_id, round_id)
-                    val_loss, val_acc = self._evaluate_single_client(client_id)
                     round_losses.append(loss)
-                    round_accs.append(val_acc)
-
-                    if (client_id + 1) % 10 == 0:
-                        print(f"  客户端 {client_id - 9}-{client_id + 1} 训练完成 - 平均准确率: {np.mean(round_accs[-10:]):.4f}")
 
             # ---- 阶段2-7: 分层聚合 ----
-            comm = CommStats()
+            link_profile = (self.frozen_inputs or {}).get("link_profiles.json", {})
+            link_default = link_profile.get("default", link_profile)
+            bandwidth_mbps = link_default.get(
+                "bandwidth_mbps", link_default.get("default_bandwidth_mbps")
+            )
+            if bandwidth_mbps is None and self.config.bandwidth is not None:
+                bandwidth_mbps = float(self.config.bandwidth) * 8.0
+            latency_ms = link_default.get(
+                "latency_ms", link_default.get("default_latency_ms", self.config.latency)
+            )
+            comm = CommStats(
+                round_id, bandwidth_mbps=bandwidth_mbps,
+                latency_ms=latency_ms,
+                drop_rate=float(link_default.get("drop_rate", self.config.drop_rate)),
+            )
             if use_hierarchical:
                 cluster_heads = self._get_live_cluster_heads()
                 best_client_id = self.election_results.get('best_client_id', -1)
@@ -1810,103 +2450,193 @@ class NewFLRuntime:
                     for lid, params in zip(live_ids, live_params):
                         all_params[lid] = params
                     wrapped_models = [ModelWrapper(p) if p is not None else None for p in all_params]
+                    if live_params:
+                        comm.model_bytes = compute_model_bytes(live_params[0])
                 else:
                     wrapped_models = self.models
 
-                # 聚合在 CPU 上做（避免 GPU OOM，30个ResNet18 + 中间结果 ~3GB）
                 agg_device = torch.device('cpu')
 
                 print("\n[阶段2] 簇内分层聚合")
-                aggregated_models = hierarchical_aggregate(
+                aggregated_weighted = hierarchical_weighted_reduce(
                     wrapped_models,
                     self.tree_mapping,
                     cluster_heads,
-                    agg_device,
                     comm=comm,
                     skip_nodes=self.failed_nodes,
                 )
                 print(f"  簇内分层聚合完成，共 {len(cluster_heads)} 个簇")
-                print(f"  📡 通信: 簇内上传 {comm.intra_cluster_msgs} 条消息")
+                print(f"  📡 簇内上行: {comm.intra_cluster_msgs} 条")
 
-                print("\n[阶段3] 簇间聚合（上传到最佳客户端）")
+                intra_cluster_rounds = max(
+                    1, int(getattr(self.config, "intra_cluster_rounds", 1))
+                )
+                for intra_round_id in range(1, intra_cluster_rounds):
+                    print(
+                        f"\n[阶段2.{intra_round_id}] 簇模型下发并执行额外簇内训练 "
+                        f"({intra_round_id + 1}/{intra_cluster_rounds})"
+                    )
+                    cluster_params = {
+                        head_id: finalize_weighted_state(weighted_state)
+                        for head_id, weighted_state in aggregated_weighted.items()
+                        if weighted_state is not None
+                    }
+                    distribute_returned_models_to_clusters(
+                        returned_models=cluster_params,
+                        tree_mapping=self.tree_mapping,
+                        models=wrapped_models,
+                        cluster_heads=cluster_heads,
+                        skip_nodes=self.failed_nodes,
+                        comm=comm,
+                        allow_unreachable=bool(self.failed_edges),
+                    )
+
+                    if use_ray:
+                        live_actors, live_ids = self._get_live_ray_actors()
+                        ray.get([
+                            actor.set_model_params.remote({
+                                key: value.detach().cpu()
+                                for key, value in wrapped_models[node_id].state_dict().items()
+                            })
+                            for actor, node_id in zip(live_actors, live_ids)
+                        ])
+                        extra_train_results = []
+                        limit = max(1, self.config.max_concurrent_gpu_clients)
+                        for start in range(0, len(live_actors), limit):
+                            batch = live_actors[start:start + limit]
+                            extra_train_results.extend(ray.get([
+                                actor.local_train.remote(round_id, intra_round_id)
+                                for actor in batch
+                            ]))
+                        round_losses.extend(
+                            result['train_loss'] for result in extra_train_results
+                        )
+                        live_params = ray.get([
+                            actor.get_model_params.remote() for actor in live_actors
+                        ])
+                        all_params = [None] * self.config.num_clients
+                        for node_id, params in zip(live_ids, live_params):
+                            all_params[node_id] = params
+                        wrapped_models = [
+                            ModelWrapper(params) if params is not None else None
+                            for params in all_params
+                        ]
+                    else:
+                        for client_id in range(self.config.num_clients):
+                            if client_id in self.failed_nodes:
+                                continue
+                            round_losses.append(
+                                self._train_single_client(client_id, round_id)
+                            )
+
+                    aggregated_weighted = hierarchical_weighted_reduce(
+                        wrapped_models,
+                        self.tree_mapping,
+                        cluster_heads,
+                        comm=comm,
+                        skip_nodes=self.failed_nodes,
+                    )
+                    print(
+                        f"  第 {intra_round_id + 1}/{intra_cluster_rounds} 次簇内聚合完成"
+                    )
+
+                round_cluster_diagnostics = self._evaluate_cluster_diagnostics(
+                    round_id, cluster_heads, aggregated_weighted
+                )
+
+                print("\n[阶段3] 簇首沿选举路由上传到 GEA")
                 cluster_sizes, routing_tables = build_cluster_info(
                     self.tree_mapping,
                     self.clustering_results,
-                    self.election_results
+                    self.election_results,
                 )
-                print(f"  最佳客户端: Node {best_client_id}")
-                print(f"  簇大小信息: {cluster_sizes}")
-
                 message_queue = {}
                 for head_id in cluster_heads:
                     forward_model_to_best_client(
                         source_cluster_head=head_id,
-                        model_dict=aggregated_models[head_id],
-                        client_count=cluster_sizes[head_id],
+                        weighted_state=aggregated_weighted[head_id],
                         routing_tables=routing_tables,
                         best_client_id=best_client_id,
                         message_queue=message_queue,
-                        comm=comm
+                        comm=comm,
                     )
-                    print(f"  簇首 {head_id} 的模型已发送到最佳客户端（路径: {message_queue[best_client_id][-1].path_stack}）")
-                print(f"  📡 通信: 簇间转发 {comm.inter_cluster_forward_hops} 跳")
+                print(f"  GEA: Node {best_client_id}; 簇样本数: {cluster_sizes}")
+                print(f"  📡 簇间上行: {comm.inter_cluster_forward_hops} 跳")
 
-                print("\n[阶段4] 最佳客户端聚合所有簇首模型")
+                print("\n[阶段4] GEA 按真实样本数聚合所有簇模型")
                 final_model, path_stacks = aggregate_models_at_best_client(
                     best_client_id=best_client_id,
                     models=wrapped_models,
                     message_queue=message_queue,
-                    device=agg_device
+                    device=agg_device,
                 )
-                print(f"  聚合了 {len(path_stacks)} 个簇首的模型")
+                latest_global_params = final_model
+                def collect_cluster_nodes(node_id: int) -> None:
+                    if node_id in self.failed_nodes or node_id in aggregated_nodes_this_round:
+                        return
+                    aggregated_nodes_this_round.add(node_id)
+                    for child_id in (self.tree_mapping or {}).get(node_id, {}).get("children", []):
+                        collect_cluster_nodes(child_id)
 
-                print("\n[阶段5] 原路返回模型到各簇首")
+                for reachable_head in path_stacks:
+                    collect_cluster_nodes(reachable_head)
+
+                print("\n[阶段5] 全局模型沿上传路径原路返回簇首")
                 return_queue = {}
                 return_model_to_cluster_heads(
                     final_model=final_model,
                     path_stacks=path_stacks,
                     return_queue=return_queue,
-                    comm=comm
+                    comm=comm,
                 )
-                print(f"  📡 通信: 簇间返回 {comm.inter_cluster_return_hops} 跳")
+                returned_models = {
+                    head_id: return_queue[head_id][-1]['model_dict']
+                    for head_id in cluster_heads
+                    if head_id in return_queue and return_queue[head_id]
+                }
+                print(f"  📡 簇间下行: {comm.inter_cluster_return_hops} 跳")
 
-                print("\n[阶段6] 将最终模型分发到所有存活节点")
-                if use_ray:
-                    final_model_cpu = {k: v.cpu() for k, v in final_model.items()}
-                    live_actors, live_ids = self._get_live_ray_actors()
-                    ray.get([a.set_model_params.remote(final_model_cpu) for a in live_actors])
-                    comm.flat_download_msgs = len(live_ids)
-                else:
-                    for head_id in cluster_heads:
-                        distribute_models_to_cluster(
-                            aggregated_models={head_id: final_model},
-                            tree_mapping=self.tree_mapping,
-                            models=self.models,
-                            cluster_heads=[head_id],
-                            device=self.device,
-                            comm=comm
-                        )
-                print(f"  📡 通信: 簇内分发 {comm.intra_cluster_dist_msgs} 条消息")
-
-                print("\n[阶段7] 计算所有存活节点在本地验证集上的平均准确率")
+                print("\n[阶段6] 簇首沿原簇树下发全局模型")
+                distribute_returned_models_to_clusters(
+                    returned_models=returned_models,
+                    tree_mapping=self.tree_mapping,
+                    models=wrapped_models,
+                    cluster_heads=cluster_heads,
+                    skip_nodes=self.failed_nodes,
+                    comm=comm,
+                    allow_unreachable=bool(self.failed_edges),
+                )
                 if use_ray:
                     live_actors, live_ids = self._get_live_ray_actors()
-                    eval_results = ray.get([a.evaluate.remote() for a in live_actors])
-                    all_node_accs = [r['val_acc'] for r in eval_results]
-                else:
-                    all_node_accs = []
-                    for client_id in range(self.config.num_clients):
-                        _, val_acc = self._evaluate_single_client(client_id)
-                        all_node_accs.append(val_acc)
+                    if self.failed_edges:
+                        ray.get([
+                            actor.set_model_params.remote({
+                                key: value.detach().cpu()
+                                for key, value in wrapped_models[node_id].state_dict().items()
+                            })
+                            for actor, node_id in zip(live_actors, live_ids)
+                        ])
+                    else:
+                        final_model_cpu = {k: v.cpu() for k, v in final_model.items()}
+                        ray.get([a.set_model_params.remote(final_model_cpu) for a in live_actors])
+                print(f"  📡 簇内下行: {comm.intra_cluster_dist_msgs} 条")
+                print(f"  📡 本轮总通信: {comm.total_msgs} 条")
 
-                avg_all_node_acc = np.mean(all_node_accs)
-                results['global_accuracies'].append(avg_all_node_acc)
-                print(f"  所有节点平均准确率: {avg_all_node_acc:.4f}")
+                print("\n[阶段7] 在完整全局测试集上评估一次")
+                global_loss, global_acc = self._evaluate_global_params(final_model)
+                results['global_losses'].append(global_loss)
+                results['global_accuracies'].append(global_acc)
+                for row in round_cluster_diagnostics:
+                    row["final_global_loss"] = global_loss
+                    row["final_global_accuracy"] = global_acc
+                results['cluster_diagnostics'].extend(round_cluster_diagnostics)
+                print(f"  全局测试损失: {global_loss:.4f}, 全局测试准确率: {global_acc:.4f}")
 
             elif use_ray:
                 # ---- 阶段2-4: 扁平聚合（消融实验：无聚类模式） ----
                 print("\n[阶段2] 扁平聚合（存活客户端 → 聚合节点）")
                 live_actors, live_ids = self._get_live_ray_actors()
+                aggregated_nodes_this_round = set(live_ids)
                 all_params = ray.get([a.get_model_params.remote() for a in live_actors])
                 agg_device = torch.device('cpu')
 
@@ -1919,65 +2649,174 @@ class NewFLRuntime:
                     best_id = live_ids[0] if live_ids else 0
 
                 final_params = flat_aggregate(all_params, device=agg_device)
-                comm.flat_upload_msgs = len(all_params)
+                latest_global_params = final_params
+                comm.flat_upload_msgs = sum(client_id != best_id for client_id in live_ids)
                 if all_params:
                     comm.model_bytes = compute_model_bytes(all_params[0])
+                for client_id in live_ids:
+                    if client_id != best_id:
+                        comm.record_transfer(
+                            client_id, best_id, "MODEL_UPLOAD", comm.model_bytes,
+                            phase="MODEL_UPLOAD", flow_id="fedavg:up",
+                        )
                 print(f"  聚合了 {len(all_params)} 个客户端的模型 (聚合节点: Node {best_id})")
                 print(f"  📡 通信: 上传 {comm.flat_upload_msgs} 条")
 
                 print("\n[阶段3] 分发聚合模型到所有存活节点")
                 final_params_cpu = {k: v.cpu() for k, v in final_params.items()}
                 ray.get([a.set_model_params.remote(final_params_cpu) for a in live_actors])
-                comm.flat_download_msgs = len(live_ids)
+                comm.flat_download_msgs = sum(client_id != best_id for client_id in live_ids)
+                for client_id in live_ids:
+                    if client_id != best_id:
+                        comm.record_transfer(
+                            best_id, client_id, "GLOBAL_MODEL", comm.model_bytes,
+                            phase="MODEL_DISTRIBUTION", flow_id="fedavg:down",
+                        )
                 print(f"  📡 通信: 下载 {comm.flat_download_msgs} 条")
 
                 print(f"  📡 本轮总通信: {comm.total_msgs} 条消息, {comm.total_bytes:,} 字节")
 
-                print("\n[阶段4] 计算所有存活节点在本地验证集上的平均准确率")
-                eval_results = ray.get([a.evaluate.remote() for a in live_actors])
-                all_node_accs = [r['val_acc'] for r in eval_results]
-                avg_all_node_acc = np.mean(all_node_accs)
-                results['global_accuracies'].append(avg_all_node_acc)
-                print(f"  存活节点平均准确率: {avg_all_node_acc:.4f}")
+                print("\n[阶段4] 在完整全局测试集上评估一次")
+                global_loss, global_acc = self._evaluate_global_params(final_params)
+                results['global_losses'].append(global_loss)
+                results['global_accuracies'].append(global_acc)
+                print(f"  全局测试损失: {global_loss:.4f}, 全局测试准确率: {global_acc:.4f}")
 
             avg_loss = np.mean(round_losses)
-            avg_acc = np.mean(round_accs)
             results['round_losses'].append(avg_loss)
-            results['round_accuracies'].append(avg_acc)
+            if global_acc is not None:
+                results['round_accuracies'].append(global_acc)
 
             round_time = time.time() - round_start_time
             print(f"\n  本轮平均训练损失: {avg_loss:.4f}")
-            print(f"  本轮平均验证准确率: {avg_acc:.4f}")
             if results['global_accuracies']:
                 print(f"  本轮全局准确率: {results['global_accuracies'][-1]:.4f}")
             print(f"  本轮耗时: {round_time:.2f}s")
 
             # 记录本轮指标（使用分层聚合后的全局准确率作为 val_acc）
-            global_acc = results['global_accuracies'][-1] if results['global_accuracies'] else avg_acc
+            recorded_global_acc = results['global_accuracies'][-1] if results['global_accuracies'] else 0.0
+            recorded_global_loss = results['global_losses'][-1] if results['global_losses'] else 0.0
             live_count = len(self.active_nodes - self.failed_nodes)
             failed_count = len(self.failed_nodes)
             monitor.record_round(
                 round_id=round_id,
                 avg_train_loss=avg_loss,
-                val_loss=avg_loss,
-                val_acc=global_acc,
+                val_loss=recorded_global_loss,
+                val_acc=recorded_global_acc,
                 selected_count=live_count,
                 dropped_count=failed_count,
                 comm_success_count=comm.total_msgs if use_ray else 0,
                 comm_failure_count=0,
                 comm_timeout_count=0,
-                broadcast_success_count=comm.flat_download_msgs if use_ray else 0,
+                broadcast_success_count=(
+                    (comm.inter_cluster_return_hops + comm.intra_cluster_dist_msgs
+                     if use_hierarchical else comm.flat_download_msgs)
+                    if use_ray else 0
+                ),
                 broadcast_failure_count=0,
-                upload_success_count=comm.flat_upload_msgs if use_ray else 0,
+                upload_success_count=(
+                    (comm.intra_cluster_msgs + comm.inter_cluster_forward_hops
+                     if use_hierarchical else comm.flat_upload_msgs)
+                    if use_ray else 0
+                ),
                 upload_failure_count=0,
                 upload_storage_blocked_count=0,
                 gossip_success_count=0,
                 gossip_failure_count=0,
+                round_wall_clock_seconds=round_time,
             )
             # 保存每轮通信统计
             if 'round_comm_stats' not in results:
                 results['round_comm_stats'] = []
             results['round_comm_stats'].append(comm.to_dict())
+            for event_index, event in enumerate(comm.events):
+                unified_comm_events.append({
+                    "experiment_id": run_name,
+                    "method": method_name,
+                    "seed": self.config.seed,
+                    "timestamp_start": None,
+                    "timestamp_end": None,
+                    "message_id": f"r{round_id}-m{event_index}",
+                    **event,
+                })
+
+            live_nodes = sorted(self.active_nodes - self.failed_nodes)
+            total_samples = sum(len(client["indices"]) for client in self.clients)
+            live_samples = sum(
+                len(self.clients[node_id]["indices"]) for node_id in live_nodes
+            )
+            roles = {}
+            parents = {}
+            children_counts = {}
+            best_id = (self.election_results or {}).get("best_client_id", -1)
+            for node_id in range(self.config.num_clients):
+                info = (self.tree_mapping or {}).get(node_id, {})
+                parent = info.get("parent")
+                children = [c for c in info.get("children", []) if c in live_nodes]
+                parents[node_id] = parent
+                children_counts[node_id] = len(children)
+                if node_id == best_id:
+                    roles[node_id] = "ROOT"
+                elif parent is None and node_id in live_nodes:
+                    roles[node_id] = "CLUSTER_HEAD"
+                elif children:
+                    roles[node_id] = "INTERMEDIATE"
+                else:
+                    roles[node_id] = "CLIENT"
+            # Record semantic aggregation inputs separately from communication
+            # messages: each live node contributes its own model, and the GEA
+            # also consumes the zero-hop model from its local cluster head.
+            aggregation_inputs_by_phase = {
+                "INTRA_CLUSTER_UPLOAD": {},
+                "INTER_CLUSTER_UPLOAD": {},
+            }
+
+            def count_tree_parts(node_id: int) -> int:
+                info = (self.tree_mapping or {}).get(node_id, {})
+                # In the Ray path model objects live inside actors and
+                # ``self.models`` is intentionally None.  A live participant
+                # nevertheless contributes exactly one local weighted state.
+                own = int(node_id in live_nodes)
+                parts = own
+                for child_id in info.get("children", []):
+                    child_parts = count_tree_parts(child_id)
+                    if child_parts > 0:
+                        parts += 1
+                if parts > 1:
+                    aggregation_inputs_by_phase["INTRA_CLUSTER_UPLOAD"][str(node_id)] = parts
+                return parts
+
+            for head_id in cluster_heads:
+                count_tree_parts(head_id)
+            gea_inputs = len(message_queue.get(best_id, []))
+            if gea_inputs > 1:
+                aggregation_inputs_by_phase["INTER_CLUSTER_UPLOAD"][str(best_id)] = gea_inputs
+            aggregation_operation_ids_by_phase = {
+                phase: {
+                    node: f"r{round_id}:aggregate:{phase.lower()}:{node}"
+                    for node in nodes
+                }
+                for phase, nodes in aggregation_inputs_by_phase.items()
+            }
+            monitor.record_round_context(
+                experiment_id=run_name, method=method_name, seed=self.config.seed,
+                round=round_id, node_ids=list(range(self.config.num_clients)),
+                roles=roles, parents=parents, children_counts=children_counts,
+                active_nodes=live_nodes, failed_nodes=sorted(self.failed_nodes),
+                eligible_node_ratio=len(live_nodes) / max(1, self.config.num_clients),
+                reachable_node_ratio=(len(aggregated_nodes_this_round)
+                                      / max(1, len(live_nodes))),
+                eligible_sample_ratio=live_samples / max(1, total_samples),
+                aggregated_sample_ratio=(sum(
+                    len(self.clients[node_id]["indices"])
+                    for node_id in aggregated_nodes_this_round
+                ) / max(1, live_samples)),
+                aggregation_inputs_by_phase=aggregation_inputs_by_phase,
+                aggregation_operation_ids_by_phase=aggregation_operation_ids_by_phase,
+                round_completion_ratio=1.0 if global_acc is not None else 0.0,
+                round_wall_clock_seconds=round_time,
+                round_latency_sim_ms=None,
+            )
 
         results['training_time'] = time.time() - total_start_time
 
@@ -1995,47 +2834,21 @@ class NewFLRuntime:
             print(f"  故障节点列表: {sorted(self.failed_nodes)}")
             print(f"  存活节点数: {len(self.active_nodes - self.failed_nodes)}")
 
-        print("\n最终每个存活客户端的准确率:")
-        if use_ray:
-            live_actors, live_ids = self._get_live_ray_actors()
-            eval_results = ray.get([a.evaluate.remote() for a in live_actors])
-            acc_by_id = dict(zip(live_ids, [r['val_acc'] for r in eval_results]))
-            final_accs = [
-                acc_by_id.get(i, 0.0) if i not in self.failed_nodes else 0.0
-                for i in range(self.config.num_clients)
-            ]
-        else:
-            final_accs = []
-            for client_id in range(self.config.num_clients):
-                if client_id in self.failed_nodes:
-                    final_accs.append(0.0)  # 故障节点准确率记为 0
-                else:
-                    _, val_acc = self._evaluate_single_client(client_id)
-                    final_accs.append(val_acc)
-
-        results['final_client_accuracies'] = final_accs
-
-        for i in range(0, self.config.num_clients, 10):
-            end = min(i + 10, self.config.num_clients)
-            acc_str = ", ".join([
-                f"{final_accs[j]:.4f}" if j not in self.failed_nodes else f"FAILED"
-                for j in range(i, end)
-            ])
-            print(f"  客户端 {i + 1}-{end}: {acc_str}")
-
-        live_accs = [a for i, a in enumerate(final_accs) if i not in self.failed_nodes]
-        if live_accs:
-            print(f"\n训练统计（存活节点）:")
-            print(f"  平均准确率: {np.mean(live_accs):.4f}")
-            print(f"  最高准确率: {np.max(live_accs):.4f}")
-            print(f"  最低准确率: {np.min(live_accs):.4f}")
         print(f"  总训练耗时: {results['training_time']:.2f}s")
 
         if results['global_accuracies']:
-            print(f"\n全局平均准确率统计（所有节点本地验证集平均）:")
+            print(f"\n完整全局测试集准确率统计:")
             print(f"  最终准确率: {results['global_accuracies'][-1]:.4f}")
             print(f"  最高准确率: {np.max(results['global_accuracies']):.4f}")
             print(f"  最低准确率: {np.min(results['global_accuracies']):.4f}")
+
+        if self.config.save_model and latest_global_params is not None:
+            model_path = os.path.join(output_dir, f"{run_name}_final_model.pt")
+            torch.save(
+                {key: value.detach().cpu() for key, value in latest_global_params.items()},
+                model_path,
+            )
+            print(f"  最终全局模型已保存: {model_path}")
 
         # ---- 保存指标并生成图表 ----
         print(f"\n{'='*60}")
@@ -2043,6 +2856,154 @@ class NewFLRuntime:
         print(f"{'='*60}")
 
         monitor.dump(output_dir, run_name)
+        if results['cluster_diagnostics']:
+            import json as _json
+            import pandas as pd
+            cluster_df = pd.DataFrame(results['cluster_diagnostics'])
+            cluster_csv = os.path.join(output_dir, "cluster_round_metrics.csv")
+            cluster_df.to_csv(cluster_csv, index=False)
+            per_round = []
+            for diagnostic_round, frame in cluster_df.groupby("round_id"):
+                weights = frame["validation_samples"].astype(float)
+                weight_total = max(1.0, float(weights.sum()))
+                pair_weights = frame["label_pair_count"].astype(float)
+                pair_total = float(pair_weights.sum())
+                edge_weights = frame["tree_edge_count"].astype(float)
+                edge_total = float(edge_weights.sum())
+                global_accuracy = frame["cluster_global_accuracy"]
+                per_round.append({
+                    "round_id": int(diagnostic_round),
+                    "num_clusters": int(len(frame)),
+                    "mean_cluster_size": float(frame["num_members"].mean()),
+                    "singleton_cluster_ratio": float(
+                        (frame["num_members"] == 1).mean()
+                    ),
+                    "weighted_cluster_val_accuracy": float(
+                        (frame["cluster_val_accuracy"] * weights).sum() / weight_total
+                    ),
+                    "weighted_cluster_personalized_accuracy": (
+                        float(
+                            (frame["cluster_personalized_accuracy"] * weights).sum()
+                            / weight_total
+                        )
+                        if frame["cluster_personalized_accuracy"].notna().any() else None
+                    ),
+                    "pair_weighted_mean_label_jsd": (
+                        float((frame["mean_pairwise_label_jsd"] * pair_weights).sum()
+                              / pair_total)
+                        if pair_total > 0 else None
+                    ),
+                    "edge_weighted_mean_label_jsd": (
+                        float((frame["mean_tree_edge_label_jsd"] * edge_weights).sum()
+                              / edge_total)
+                        if edge_total > 0 else None
+                    ),
+                    "sample_weighted_pooled_label_coverage": float(
+                        (frame["pooled_label_coverage"] * frame["train_samples"]).sum()
+                        / max(1.0, float(frame["train_samples"].sum()))
+                    ),
+                    "sample_weighted_pooled_label_entropy": float(
+                        (frame["pooled_label_entropy"] * frame["train_samples"]).sum()
+                        / max(1.0, float(frame["train_samples"].sum()))
+                    ),
+                    "sample_weighted_largest_label_share": float(
+                        (frame["largest_pooled_label_share"] * frame["train_samples"]).sum()
+                        / max(1.0, float(frame["train_samples"].sum()))
+                    ),
+                    "mean_cluster_global_accuracy": (
+                        float(global_accuracy.mean())
+                        if global_accuracy.notna().any() else None
+                    ),
+                    "sample_weighted_cluster_global_accuracy": (
+                        float((global_accuracy * frame["train_samples"]).sum()
+                              / max(1.0, float(frame["train_samples"].sum())))
+                        if global_accuracy.notna().any() else None
+                    ),
+                    "final_global_accuracy": float(
+                        frame["final_global_accuracy"].iloc[0]
+                    ),
+                })
+            with open(os.path.join(output_dir, "clustering_summary.json"), "w") as handle:
+                _json.dump({
+                    "definition": "pairwise-neighbor-label-JSD acceptance constraint",
+                    "threshold": self.config.distribution_similarity_threshold,
+                    "intra_cluster_rounds": int(
+                        getattr(self.config, "intra_cluster_rounds", 1)
+                    ),
+                    "clustering_assignment_mode": getattr(
+                        self.config, "clustering_assignment_mode", "distributed"
+                    ),
+                    "diagnostic_interval": self.config.cluster_diagnostics_interval,
+                    "global_test_enabled": self.config.cluster_diagnostics_global_test,
+                    "personalized_evaluation_enabled": getattr(
+                        self.config, "enable_cluster_personalized_evaluation", False
+                    ),
+                    "client_test_partition_mode": getattr(
+                        self.config, "client_test_partition_mode", "global_balanced"
+                    ),
+                    "records": len(results['cluster_diagnostics']),
+                    "per_round": per_round,
+                }, handle, indent=2, ensure_ascii=False)
+            print(f"  簇级诊断已保存: {cluster_csv}")
+        topology_events = []
+        for failure in self.failure_log:
+            topology_events.append({
+                "experiment_id": run_name, "method": method_name,
+                "seed": self.config.seed, "round": failure.get("round"),
+                "event_time": None, "event_type": "NODE_FAILURE",
+                "target_type": "NODE", "target_id": failure.get("failed_nodes"),
+                "detected_time": None, "repair_start_time": None,
+                "repair_end_time": None, "repair_time_wall_clock_seconds": None,
+                "affected_nodes": len(failure.get("failed_nodes", [])),
+                "control_messages": None, "control_bytes": None,
+            })
+        for join in self.join_log:
+            topology_events.append({
+                "experiment_id": run_name, "method": method_name,
+                "seed": self.config.seed, "round": join.get("round"),
+                "event_time": None, "event_type": "NODE_JOIN",
+                "target_type": "NODE", "target_id": join.get("joined_nodes"),
+                "detected_time": None, "repair_start_time": None,
+                "repair_end_time": None, "repair_time_wall_clock_seconds": None,
+                "affected_nodes": len(join.get("joined_nodes", [])),
+                "control_messages": None, "control_bytes": None,
+            })
+        frozen_trace = ((self.frozen_inputs or {}).get("failure_trace.json", {}))
+        frozen_events = (frozen_trace if isinstance(frozen_trace, list)
+                         else frozen_trace.get("events", []))
+        for event in frozen_events:
+            event_type = str(event.get("event_type", "")).strip().lower()
+            if event_type not in {"link_failure", "link_recovery"}:
+                continue
+            edges = event.get("edges", [])
+            topology_events.append({
+                "experiment_id": run_name, "method": method_name,
+                "seed": self.config.seed, "round": event.get("round"),
+                "event_time": None, "event_type": event_type.upper(),
+                "target_type": "LINK", "target_id": edges,
+                "detected_time": None, "repair_start_time": None,
+                "repair_end_time": None,
+                "repair_time_wall_clock_seconds": 0.0,
+                "affected_nodes": len({node for edge in edges for node in edge}),
+                "control_messages": None, "control_bytes": None,
+            })
+        for index, event in enumerate(getattr(self, "recovery_events", [])):
+            topology_events.append({
+                "experiment_id": run_name, "method": method_name,
+                "seed": self.config.seed, "round": event.get("round"),
+                "event_time": None,
+                "event_type": str(event.get("event", "TOPOLOGY_REPAIR")).upper(),
+                "target_type": "NODE", "target_id": event.get("failed_nodes"),
+                "detected_time": None, "repair_start_time": None,
+                "repair_end_time": None,
+                "repair_time_wall_clock_seconds": event.get("time_seconds"),
+                "affected_nodes": len(event.get("failed_nodes", [])),
+                "control_messages": event.get("control_messages"),
+                "control_bytes": event.get("control_bytes"),
+            })
+        dump_system_metrics(
+            output_dir, unified_comm_events, monitor.round_contexts, topology_events
+        )
         print(f"  指标文件已保存到: {output_dir}")
 
         # ---- 保存动态节点日志 ----
@@ -2125,5 +3086,12 @@ class NewFLRuntime:
             print(f"  Warning: 无法导入绘图模块: {e}")
         except Exception as e:
             print(f"  Warning: 生成图表失败: {e}")
+
+        self._save_completion_status(
+            output_dir=output_dir,
+            requested_rounds=num_rounds,
+            completed_rounds=len(monitor.round_metrics),
+            status="COMPLETE",
+        )
 
         return results

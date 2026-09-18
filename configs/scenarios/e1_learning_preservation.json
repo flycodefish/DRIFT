@@ -1,0 +1,7 @@
+{
+  "name": "e1_learning_preservation",
+  "purpose": "Learning-preservation control: homogeneous resources and links, no failures.",
+  "resource_profile": {"mode": "homogeneous", "capacity": 1.0},
+  "network_profile": {"mode": "homogeneous", "default_bandwidth_mbps": 100.0, "default_latency_ms": 5.0},
+  "failure_profile": {"mode": "none"}
+}

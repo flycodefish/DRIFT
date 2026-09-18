@@ -1,0 +1,15 @@
+{
+  "name": "e3_resource_h10",
+  "purpose": "Resource-ablation stress setting with compute heterogeneity H=10.",
+  "resource_profile": {
+    "mode": "tiers",
+    "reference_cpu_cores": 16,
+    "tiers": [
+      {"name": "slow", "fraction": 0.2, "capacity": 0.1},
+      {"name": "medium", "fraction": 0.6, "capacity": 0.4},
+      {"name": "fast", "fraction": 0.2, "capacity": 1.0}
+    ]
+  },
+  "network_profile": {"mode": "medium_heterogeneous"},
+  "failure_profile": {"mode": "none"}
+}

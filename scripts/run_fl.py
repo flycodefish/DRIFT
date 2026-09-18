@@ -3,9 +3,17 @@
 import argparse
 import time
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any
+
+# Prefer this checkout when launched as ``python scripts/run_fl.py``. This
+# prevents another editable/install copy of ``fl_core`` from being imported.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+project_root_str = str(PROJECT_ROOT)
+if sys.path[0] != project_root_str:
+    sys.path.insert(0, project_root_str)
 
 try:
     import yaml
@@ -45,6 +53,8 @@ def parse_args() -> FLConfig:
         default=None,
         help="Path to YAML configuration file"
     )
+    parser.add_argument("--frozen-inputs-dir", type=str, default=None,
+                        help="Shared immutable input bundle directory")
     
     # 命令行参数（可覆盖配置文件）
     parser.add_argument(
@@ -84,7 +94,7 @@ def parse_args() -> FLConfig:
     # Data parameters
     parser.add_argument(
         "--dataset",
-        choices=["synthetic", "cifar10", "cifar100"],
+        choices=["synthetic", "cifar10", "cifar100", "har"],
         default=None
     )
     parser.add_argument(
@@ -95,6 +105,8 @@ def parse_args() -> FLConfig:
     parser.add_argument("--num-classes", type=int, default=None)
     parser.add_argument("--input-dim", type=int, default=None)
     parser.add_argument("--dirichlet-alpha", type=float, default=None)
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Dataset root directory (overrides YAML data_dir)")
     
     # Model parameters
     parser.add_argument("--model", type=str, default=None)
@@ -137,8 +149,10 @@ def parse_args() -> FLConfig:
     set_param("--num-classes", args.num_classes, "num_classes")
     set_param("--input-dim", args.input_dim, "input_dim")
     set_param("--dirichlet-alpha", args.dirichlet_alpha, "dirichlet_alpha")
+    set_param("--data-dir", args.data_dir, "data_dir")
     set_param("--model", args.model)
     set_param("--output-dir", args.output_dir, "output_dir")
+    set_param("--frozen-inputs-dir", args.frozen_inputs_dir, "frozen_inputs_dir")
     
     # 根据算法自动设置拓扑
     algorithm = config_dict.get("algorithm", "fedavg")
@@ -199,29 +213,20 @@ def aggregate_models_fedavg(payloads: list[dict]) -> dict:
     if not payloads:
         raise ValueError("No payloads to aggregate")
 
-    first_params = payloads[0]["params"]
-    aggregated = {k: v.clone().float().zero_() for k, v in first_params.items()}
-    
-    total_examples = sum(item["num_examples"] for item in payloads)
-    
-    if total_examples == 0:
-        for item in payloads:
-            for k in aggregated:
-                aggregated[k] += item["params"][k].float()
-        for k in aggregated:
-            aggregated[k] /= len(payloads)
-    else:
-        for item in payloads:
-            weight = item["num_examples"] / total_examples
-            for k in aggregated:
-                aggregated[k] += item["params"][k].float() * weight
-    
-    return aggregated
+    from deasfl.aggregation import sample_weighted_average
+
+    counts = [item["num_examples"] for item in payloads]
+    if sum(counts) == 0:
+        counts = [1] * len(payloads)
+    return sample_weighted_average(
+        [item["params"] for item in payloads], counts
+    )
 
 
 def run_fedavg(runtime: RayFLRuntime, cfg: FLConfig, run_timestamp: str) -> None:
     """运行 FedAvg 算法（星形拓扑）"""
     params = runtime.init_model_params()
+    runtime.save_experiment_inputs(params)
     start_time = time.perf_counter()
     
     print("=" * 70)
@@ -238,6 +243,7 @@ def run_fedavg(runtime: RayFLRuntime, cfg: FLConfig, run_timestamp: str) -> None
             runtime.clients[client_id].set_proximal_mu.remote(cfg.proximal_mu)
     
     for round_id in range(cfg.rounds):
+        round_start_time = time.perf_counter()
         print(f"\n[Round {round_id + 1}/{cfg.rounds}]")
         
         runtime.broadcast_model(params, round_id)
@@ -248,7 +254,7 @@ def run_fedavg(runtime: RayFLRuntime, cfg: FLConfig, run_timestamp: str) -> None
                 runtime.clients[client_id].set_global_params.remote(params)
 
         selected = runtime.select_clients()
-        active, dropped = runtime.inject_dropouts(selected)
+        active, dropped = runtime.inject_dropouts(selected, round_id)
         
         print(f"  Selected: {len(selected)}, Active: {len(active)}, Dropped: {len(dropped)}")
         
@@ -285,6 +291,7 @@ def run_fedavg(runtime: RayFLRuntime, cfg: FLConfig, run_timestamp: str) -> None
             upload_storage_blocked_count=comm_summary["upload_storage_blocked_count"],
             gossip_success_count=0,
             gossip_failure_count=0,
+            round_wall_clock_seconds=time.perf_counter() - round_start_time,
         )
         
         print(f"  Train loss: {avg_train_loss:.4f}")
@@ -308,6 +315,7 @@ def run_fedavg(runtime: RayFLRuntime, cfg: FLConfig, run_timestamp: str) -> None
 def run_gossip(runtime: RayFLRuntime, cfg: FLConfig, run_timestamp: str) -> None:
     """运行 Gossip 协议（网状拓扑）"""
     params = runtime.init_model_params()
+    runtime.save_experiment_inputs(params)
     start_time = time.perf_counter()
     
     print("=" * 70)
@@ -321,10 +329,11 @@ def run_gossip(runtime: RayFLRuntime, cfg: FLConfig, run_timestamp: str) -> None
     runtime.broadcast_model(params, round_id=0)
     
     for round_id in range(cfg.rounds):
+        round_start_time = time.perf_counter()
         print(f"\n[Round {round_id + 1}/{cfg.rounds}]")
         
         selected = runtime.select_clients()
-        active, dropped = runtime.inject_dropouts(selected)
+        active, dropped = runtime.inject_dropouts(selected, round_id)
         
         print(f"  Selected: {len(selected)}, Active: {len(active)}, Dropped: {len(dropped)}")
         
@@ -349,8 +358,15 @@ def run_gossip(runtime: RayFLRuntime, cfg: FLConfig, run_timestamp: str) -> None
         # 清理所有客户端的GPU显存缓存，释放临时张量
         runtime.clear_all_client_caches()
         
-        # 不传入params，让evaluate_global自动从客户端聚合模型进行评估
-        val_loss, val_acc = runtime.evaluate_global()
+        include_local = (
+            cfg.decentralized_diagnostic_interval > 0
+            and (round_id + 1) % cfg.decentralized_diagnostic_interval == 0
+        )
+        params, decentralized_metrics = runtime.evaluate_decentralized(
+            active, include_local=include_local
+        )
+        val_loss = decentralized_metrics["consensus_loss"]
+        val_acc = decentralized_metrics["consensus_accuracy"]
         avg_train_loss = sum(r["train_loss"] for r in train_results) / max(1, len(train_results))
         comm_summary = runtime.summarize_round_comm(round_id)
         
@@ -371,6 +387,10 @@ def run_gossip(runtime: RayFLRuntime, cfg: FLConfig, run_timestamp: str) -> None
             upload_storage_blocked_count=comm_summary["upload_storage_blocked_count"],
             gossip_success_count=gossip_stats.get("gossip_push_success_count", 0),
             gossip_failure_count=gossip_stats.get("gossip_push_failure_count", 0),
+            round_wall_clock_seconds=time.perf_counter() - round_start_time,
+        )
+        runtime.monitor.record_decentralized_metrics(
+            round_id, **decentralized_metrics
         )
         
         print(f"  Train loss: {avg_train_loss:.4f}")
@@ -400,6 +420,7 @@ def run_dtd(runtime: RayFLRuntime, cfg: FLConfig, run_timestamp: str) -> None:
     higher mixing weights.
     """
     params = runtime.init_model_params()
+    runtime.save_experiment_inputs(params)
     start_time = time.perf_counter()
 
     # Compute and distribute label distributions
@@ -424,10 +445,11 @@ def run_dtd(runtime: RayFLRuntime, cfg: FLConfig, run_timestamp: str) -> None:
     runtime.broadcast_model(params, round_id=0)
 
     for round_id in range(cfg.rounds):
+        round_start_time = time.perf_counter()
         print(f"\n[Round {round_id + 1}/{cfg.rounds}]")
 
         selected = runtime.select_clients()
-        active, dropped = runtime.inject_dropouts(selected)
+        active, dropped = runtime.inject_dropouts(selected, round_id)
 
         print(f"  Selected: {len(selected)}, Active: {len(active)}, Dropped: {len(dropped)}")
 
@@ -449,7 +471,15 @@ def run_dtd(runtime: RayFLRuntime, cfg: FLConfig, run_timestamp: str) -> None:
 
         runtime.clear_all_client_caches()
 
-        val_loss, val_acc = runtime.evaluate_global()
+        include_local = (
+            cfg.decentralized_diagnostic_interval > 0
+            and (round_id + 1) % cfg.decentralized_diagnostic_interval == 0
+        )
+        params, decentralized_metrics = runtime.evaluate_decentralized(
+            active, include_local=include_local
+        )
+        val_loss = decentralized_metrics["consensus_loss"]
+        val_acc = decentralized_metrics["consensus_accuracy"]
         avg_train_loss = sum(r["train_loss"] for r in train_results) / max(1, len(train_results))
         comm_summary = runtime.summarize_round_comm(round_id)
 
@@ -470,6 +500,10 @@ def run_dtd(runtime: RayFLRuntime, cfg: FLConfig, run_timestamp: str) -> None:
             upload_storage_blocked_count=comm_summary["upload_storage_blocked_count"],
             gossip_success_count=dtd_stats.get("gossip_push_success_count", 0),
             gossip_failure_count=dtd_stats.get("gossip_push_failure_count", 0),
+            round_wall_clock_seconds=time.perf_counter() - round_start_time,
+        )
+        runtime.monitor.record_decentralized_metrics(
+            round_id, **decentralized_metrics
         )
 
         print(f"  Train loss: {avg_train_loss:.4f}")
@@ -564,15 +598,16 @@ def main():
             run_fedavg(runtime, cfg, run_timestamp)
         else:
             run_gossip(runtime, cfg, run_timestamp)
+        runtime.save_completion_status("COMPLETE")
+    except BaseException as exc:
+        runtime.save_completion_status("FAILED", error=repr(exc))
+        raise
     finally:
         runtime.shutdown()
 
 
 if __name__ == "__main__":
-    import os
-    # 使用可扩展段，能极大减少碎片化导致的 OOM
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    # 保持之前的设置
-    os.environ["CUDA_MODULE_LOADING"] = "LAZY"
+    # Keep CUDA allocator/module settings outside this launcher.  In the
+    # current fl_env setting them after importing torch can hide CUDA.
     
     main()

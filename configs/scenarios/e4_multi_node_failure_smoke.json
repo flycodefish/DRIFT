@@ -1,0 +1,22 @@
+{
+  "name": "e4_multi_node_failure_smoke",
+  "purpose": "Functional smoke for a method-independent 20% transient node failure while the remaining physical graph stays connected.",
+  "resource_profile": {
+    "mode": "tiers",
+    "reference_cpu_cores": 16,
+    "tiers": [
+      {"name": "slow", "fraction": 0.2, "capacity": 0.2},
+      {"name": "medium", "fraction": 0.6, "capacity": 0.5},
+      {"name": "fast", "fraction": 0.2, "capacity": 1.0}
+    ]
+  },
+  "network_profile": {"mode": "medium_heterogeneous"},
+  "failure_profile": {
+    "mode": "node_failure",
+    "failure_round": 2,
+    "recovery_round": 4,
+    "selection_rule": "uniform_random_connected",
+    "failure_count": 2,
+    "max_selection_attempts": 10000
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "status": "candidate_not_frozen",
+  "default_bandwidth_mbps": 100.0,
+  "default_link_latency_ms": 5.0,
+  "default_compute_capacity": 1.0,
+  "compute_capacity_by_node": {},
+  "network_capacity_by_node": {},
+  "reference_train_ms_per_sample_epoch": 0.1,
+  "aggregation_ms_per_model_mb": 0.05,
+  "link_concurrency": "independent_unlimited",
+  "duplex": "full_duplex",
+  "node_transfer_contention": "ignored",
+  "stage_overlap": "disabled",
+  "retry_policy": "latency field already includes retries and backoff",
+  "notes": "Candidate values for code validation only. Calibrate and freeze before paper experiments."
+}

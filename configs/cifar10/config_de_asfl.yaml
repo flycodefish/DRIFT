@@ -5,6 +5,7 @@
 experiment_name: de_asfl分层联邦学习
 output_dir: outputs
 seed: 42
+deterministic_training: true
 
 # ==================== 数据集设置 ====================
 dataset: cifar10
@@ -67,7 +68,8 @@ async_communication: true
 
 # ==================== 设备设置 ====================
 use_gpu: true
-num_gpus: 0.05
+num_gpus: 0.066
+max_concurrent_gpu_clients: 8
 
 # ==================== 日志设置 ====================
 log_interval: 1
