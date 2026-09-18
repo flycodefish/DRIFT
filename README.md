@@ -1,6 +1,6 @@
-# DE-ASFL
+# DRIFT
 
-DE-ASFL is a research implementation of decentralized, hierarchical federated
+DRIFT is a research implementation of decentralized, hierarchical federated
 learning under device, network, and data heterogeneity. The repository contains
 the framework, baselines, experiment configurations, launchers, and regression
 tests needed to run the code. Datasets, trained models, experiment outputs,
@@ -28,7 +28,7 @@ The frozen `environment.yml` matches the release validation environment:
 
 ```bash
 conda env create -f environment.yml
-conda activate de-asfl
+conda activate drift
 ```
 
 The validated GPU host used NVIDIA RTX 4090 GPUs with driver 550.127.05. CPU

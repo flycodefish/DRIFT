@@ -219,6 +219,16 @@ def compute_model_bytes(params: Dict[str, torch.Tensor]) -> int:
     return total
 
 
+def weighted_validation_accuracy(eval_results: List[Dict]) -> float:
+    """Aggregate client validation accuracy by validation sample count."""
+    total_samples = sum(result.get("num_samples", 0) for result in eval_results)
+    if total_samples == 0:
+        return float(np.mean([result["val_acc"] for result in eval_results]))
+    return sum(
+        result["val_acc"] * result["num_samples"] for result in eval_results
+    ) / total_samples
+
+
 def hierarchical_aggregate(models: List[nn.Module], tree_mapping: Dict[int, Dict],
                            cluster_heads: List[int], device: torch.device,
                            comm: Optional['CommStats'] = None,
@@ -435,16 +445,17 @@ def distribute_models_to_cluster(aggregated_models: Dict[int, Dict],
         for child_id in sorted(tree_mapping[node_id]['children']):
             child_cluster_id = tree_mapping[child_id]['cluster_id']
             if child_cluster_id == tree_mapping[node_id]['cluster_id']:
-                if child_id in aggregated_models:
-                    # 统计：父节点→子节点的一次模型分发
-                    if comm is not None:
-                        comm.intra_cluster_dist_msgs += 1
-                        comm.record_transfer(
-                            node_id, child_id, "GLOBAL_MODEL", comm.model_bytes,
-                            phase="INTRA_CLUSTER_DOWNLOAD",
-                            flow_id=f"cluster:{tree_mapping[node_id].get('cluster_id', node_id)}:down",
-                        )
-                    distribute_recursive(child_id, aggregated_models[child_id])
+                # Every descendant receives the same finalized cluster/global
+                # model. Loading a child's stale subtree aggregate here breaks
+                # FedAvg equivalence and leaves ordinary members unsynchronized.
+                if comm is not None:
+                    comm.intra_cluster_dist_msgs += 1
+                    comm.record_transfer(
+                        node_id, child_id, "GLOBAL_MODEL", comm.model_bytes,
+                        phase="INTRA_CLUSTER_DOWNLOAD",
+                        flow_id=f"cluster:{tree_mapping[node_id].get('cluster_id', node_id)}:down",
+                    )
+                distribute_recursive(child_id, model_state_dict)
 
     for cluster_head in cluster_heads:
         if cluster_head in aggregated_models:

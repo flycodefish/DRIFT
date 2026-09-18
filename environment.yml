@@ -1,4 +1,4 @@
-name: de-asfl
+name: drift
 channels:
   - conda-forge
 dependencies:
