@@ -156,6 +156,7 @@ class CommStats:
         self.model_bytes: int = 0               # 单个模型大小（字节）
         self.flat_upload_msgs: int = 0           # 扁平聚合：上传消息数
         self.flat_download_msgs: int = 0         # 扁平聚合：下载消息数
+        self.global_sync_performed: bool = True  # 本训练周期是否执行簇间全局同步
         self.events: list[dict] = []
 
     def record_transfer(self, src: int, dst: int, message_type: str,
@@ -194,6 +195,8 @@ class CommStats:
 
     def to_dict(self) -> dict:
         return {
+            'round_id': self.round_id,
+            'global_sync_performed': self.global_sync_performed,
             'intra_cluster_msgs': self.intra_cluster_msgs,
             'inter_cluster_forward_hops': self.inter_cluster_forward_hops,
             'inter_cluster_return_hops': self.inter_cluster_return_hops,
@@ -209,6 +212,12 @@ class CommStats:
         return (f"CommStats(total_msgs={self.total_msgs}, total_bytes={self.total_bytes:,}"
                 f" | intra={self.intra_cluster_msgs}, fwd={self.inter_cluster_forward_hops},"
                 f" ret={self.inter_cluster_return_hops}, dist={self.intra_cluster_dist_msgs})")
+
+
+def global_sync_due(round_id: int, num_rounds: int, interval: int) -> bool:
+    """Return whether a completed local/cluster cycle should globally sync."""
+    interval = max(1, int(interval))
+    return (round_id + 1) % interval == 0 or round_id == num_rounds - 1
 
 
 def compute_model_bytes(params: Dict[str, torch.Tensor]) -> int:
@@ -2277,6 +2286,7 @@ class NewFLRuntime:
             'failure_log': [],      # 动态节点故障日志
             'join_log': [],         # 动态节点加入日志
             'cluster_diagnostics': [],
+            'global_sync_rounds': [],
         }
         self.recovery_events = []   # 恢复事件计时日志
         self._join_triggered = False  # 防止重复触发 join
@@ -2555,33 +2565,44 @@ class NewFLRuntime:
                     round_id, cluster_heads, aggregated_weighted
                 )
 
-                print("\n[阶段3] 簇首沿选举路由上传到 GEA")
-                cluster_sizes, routing_tables = build_cluster_info(
-                    self.tree_mapping,
-                    self.clustering_results,
-                    self.election_results,
+                sync_interval = max(
+                    1, int(getattr(self.config, "global_sync_interval", 1))
                 )
+                perform_global_sync = global_sync_due(
+                    round_id, num_rounds, sync_interval
+                )
+                comm.global_sync_performed = perform_global_sync
                 message_queue = {}
-                for head_id in cluster_heads:
-                    forward_model_to_best_client(
-                        source_cluster_head=head_id,
-                        weighted_state=aggregated_weighted[head_id],
-                        routing_tables=routing_tables,
-                        best_client_id=best_client_id,
-                        message_queue=message_queue,
-                        comm=comm,
-                    )
-                print(f"  GEA: Node {best_client_id}; 簇样本数: {cluster_sizes}")
-                print(f"  📡 簇间上行: {comm.inter_cluster_forward_hops} 跳")
+                path_stacks = {}
 
-                print("\n[阶段4] GEA 按真实样本数聚合所有簇模型")
-                final_model, path_stacks = aggregate_models_at_best_client(
-                    best_client_id=best_client_id,
-                    models=wrapped_models,
-                    message_queue=message_queue,
-                    device=agg_device,
-                )
-                latest_global_params = final_model
+                if perform_global_sync:
+                    print("\n[阶段3] 簇首沿选举路由上传到 GEA")
+                    cluster_sizes, routing_tables = build_cluster_info(
+                        self.tree_mapping,
+                        self.clustering_results,
+                        self.election_results,
+                    )
+                    for head_id in cluster_heads:
+                        forward_model_to_best_client(
+                            source_cluster_head=head_id,
+                            weighted_state=aggregated_weighted[head_id],
+                            routing_tables=routing_tables,
+                            best_client_id=best_client_id,
+                            message_queue=message_queue,
+                            comm=comm,
+                        )
+                    print(f"  GEA: Node {best_client_id}; 簇样本数: {cluster_sizes}")
+                    print(f"  📡 簇间上行: {comm.inter_cluster_forward_hops} 跳")
+
+                    print("\n[阶段4] GEA 按真实样本数聚合所有簇模型")
+                    final_model, path_stacks = aggregate_models_at_best_client(
+                        best_client_id=best_client_id,
+                        models=wrapped_models,
+                        message_queue=message_queue,
+                        device=agg_device,
+                    )
+                    latest_global_params = final_model
+                    results['global_sync_rounds'].append(round_id)
                 def collect_cluster_nodes(node_id: int) -> None:
                     if node_id in self.failed_nodes or node_id in aggregated_nodes_this_round:
                         return
@@ -2589,25 +2610,42 @@ class NewFLRuntime:
                     for child_id in (self.tree_mapping or {}).get(node_id, {}).get("children", []):
                         collect_cluster_nodes(child_id)
 
-                for reachable_head in path_stacks:
-                    collect_cluster_nodes(reachable_head)
+                if perform_global_sync:
+                    for reachable_head in path_stacks:
+                        collect_cluster_nodes(reachable_head)
+                else:
+                    aggregated_nodes_this_round.update(
+                        self.active_nodes - self.failed_nodes
+                    )
 
-                print("\n[阶段5] 全局模型沿上传路径原路返回簇首")
-                return_queue = {}
-                return_model_to_cluster_heads(
-                    final_model=final_model,
-                    path_stacks=path_stacks,
-                    return_queue=return_queue,
-                    comm=comm,
-                )
-                returned_models = {
-                    head_id: return_queue[head_id][-1]['model_dict']
-                    for head_id in cluster_heads
-                    if head_id in return_queue and return_queue[head_id]
-                }
-                print(f"  📡 簇间下行: {comm.inter_cluster_return_hops} 跳")
+                if perform_global_sync:
+                    print("\n[阶段5] 全局模型沿上传路径原路返回簇首")
+                    return_queue = {}
+                    return_model_to_cluster_heads(
+                        final_model=final_model,
+                        path_stacks=path_stacks,
+                        return_queue=return_queue,
+                        comm=comm,
+                    )
+                    returned_models = {
+                        head_id: return_queue[head_id][-1]['model_dict']
+                        for head_id in cluster_heads
+                        if head_id in return_queue and return_queue[head_id]
+                    }
+                    print(f"  📡 簇间下行: {comm.inter_cluster_return_hops} 跳")
+                else:
+                    print(
+                        f"\n[阶段3-5] 跳过全局同步 "
+                        f"(间隔={sync_interval})"
+                    )
+                    returned_models = {
+                        head_id: finalize_weighted_state(weighted_state)
+                        for head_id, weighted_state in aggregated_weighted.items()
+                        if weighted_state is not None
+                    }
 
-                print("\n[阶段6] 簇首沿原簇树下发全局模型")
+                model_scope = "全局" if perform_global_sync else "簇"
+                print(f"\n[阶段6] 簇首沿原簇树下发{model_scope}模型")
                 distribute_returned_models_to_clusters(
                     returned_models=returned_models,
                     tree_mapping=self.tree_mapping,
@@ -2627,21 +2665,31 @@ class NewFLRuntime:
                             })
                             for actor, node_id in zip(live_actors, live_ids)
                         ])
-                    else:
+                    elif perform_global_sync:
                         final_model_cpu = {k: v.cpu() for k, v in final_model.items()}
                         ray.get([a.set_model_params.remote(final_model_cpu) for a in live_actors])
+                    else:
+                        ray.get([
+                            actor.set_model_params.remote({
+                                key: value.detach().cpu()
+                                for key, value in wrapped_models[node_id].state_dict().items()
+                            })
+                            for actor, node_id in zip(live_actors, live_ids)
+                        ])
                 print(f"  📡 簇内下行: {comm.intra_cluster_dist_msgs} 条")
                 print(f"  📡 本轮总通信: {comm.total_msgs} 条")
 
-                print("\n[阶段7] 在完整全局测试集上评估一次")
-                global_loss, global_acc = self._evaluate_global_params(final_model)
-                results['global_losses'].append(global_loss)
-                results['global_accuracies'].append(global_acc)
+                if perform_global_sync:
+                    print("\n[阶段7] 在完整全局测试集上评估一次")
+                    global_loss, global_acc = self._evaluate_global_params(final_model)
+                    results['global_losses'].append(global_loss)
+                    results['global_accuracies'].append(global_acc)
+                    print(f"  全局测试损失: {global_loss:.4f}, 全局测试准确率: {global_acc:.4f}")
                 for row in round_cluster_diagnostics:
-                    row["final_global_loss"] = global_loss
-                    row["final_global_accuracy"] = global_acc
+                    row["global_sync_performed"] = perform_global_sync
+                    row["final_global_loss"] = global_loss if perform_global_sync else np.nan
+                    row["final_global_accuracy"] = global_acc if perform_global_sync else np.nan
                 results['cluster_diagnostics'].extend(round_cluster_diagnostics)
-                print(f"  全局测试损失: {global_loss:.4f}, 全局测试准确率: {global_acc:.4f}")
 
             elif use_ray:
                 # ---- 阶段2-4: 扁平聚合（消融实验：无聚类模式） ----
@@ -2700,8 +2748,10 @@ class NewFLRuntime:
 
             round_time = time.time() - round_start_time
             print(f"\n  本轮平均训练损失: {avg_loss:.4f}")
-            if results['global_accuracies']:
+            if global_acc is not None:
                 print(f"  本轮全局准确率: {results['global_accuracies'][-1]:.4f}")
+            elif use_hierarchical:
+                print("  本轮未执行全局同步/全局评估")
             print(f"  本轮耗时: {round_time:.2f}s")
 
             # 记录本轮指标（使用分层聚合后的全局准确率作为 val_acc）
@@ -3071,6 +3121,9 @@ class NewFLRuntime:
             'dirichlet_alpha': self.config.alpha,
             'enable_election': self.config.enable_election,
             'enable_clustering': self.config.enable_clustering,
+            'global_sync_interval': int(
+                getattr(self.config, 'global_sync_interval', 1)
+            ),
         }
         # 追加通信汇总
         if 'round_comm_stats' in results and results['round_comm_stats']:

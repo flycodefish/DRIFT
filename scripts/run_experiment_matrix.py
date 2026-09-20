@@ -277,6 +277,7 @@ def _contract(args: argparse.Namespace, methods: list[str]) -> dict[str, Any]:
         "rounds": int(args.rounds),
         "local_epochs": int(args.local_epochs),
         "intra_cluster_rounds": int(getattr(args, "intra_cluster_rounds", 1)),
+        "global_sync_interval": int(getattr(args, "global_sync_interval", 1)),
         "batch_size": int(args.batch_size),
         "partition": args.partition,
         "alpha": float(args.alpha),
@@ -418,6 +419,9 @@ def prepare_plan(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "drift_random_matched", "drift_oracle_data_similar",
             } or method.startswith("drift_jsd_q"):
                 config["intra_cluster_rounds"] = args.intra_cluster_rounds
+                config["global_sync_interval"] = int(
+                    getattr(args, "global_sync_interval", 1)
+                )
             if method == "drift" and args.enable_cluster_diagnostics:
                 config["distribution_similarity_threshold"] = 0.0
                 config["enable_cluster_diagnostics"] = True
@@ -994,6 +998,11 @@ def main() -> None:
         "--intra-cluster-rounds", type=int, default=1,
         help="Client-train/cluster-aggregate cycles before each DRIFT global aggregation",
     )
+    parser.add_argument(
+        "--global-sync-interval", type=int, default=1,
+        help=("DRIFT training cycles between global aggregations; "
+              "the final cycle is always synchronized"),
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--learning-rate-min", type=float, default=1e-4)
@@ -1041,6 +1050,8 @@ def main() -> None:
         raise ValueError("--cluster-diagnostics-interval must be positive")
     if args.intra_cluster_rounds <= 0:
         raise ValueError("--intra-cluster-rounds must be positive")
+    if args.global_sync_interval <= 0:
+        raise ValueError("--global-sync-interval must be positive")
     if args.run_smoke and args.rounds > 3 and not args.allow_long:
         raise ValueError("--run-smoke above 3 rounds requires --allow-long")
     if args.status:

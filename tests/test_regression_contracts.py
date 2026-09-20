@@ -18,7 +18,8 @@ from deasfl.config import NewFLConfig
 from deasfl.runtime import (
     CommStats, ModelWrapper, NewFLRuntime, aggregate_models_at_best_client,
     distribute_returned_models_to_clusters, forward_model_to_best_client,
-    hierarchical_weighted_reduce, leaf_weighted_state, return_model_to_cluster_heads,
+    global_sync_due, hierarchical_weighted_reduce, leaf_weighted_state,
+    return_model_to_cluster_heads,
 )
 from deasfl.election import (
     ClusterMessage, ClusterMessageType, ClusterState, DistributedClustering,
@@ -75,9 +76,17 @@ class RegressionContractTests(unittest.TestCase):
     def test_cluster_diagnostics_are_disabled_by_default(self):
         self.assertFalse(NewFLConfig().enable_cluster_diagnostics)
         self.assertEqual(NewFLConfig().intra_cluster_rounds, 1)
+        self.assertEqual(NewFLConfig().global_sync_interval, 1)
         self.assertEqual(NewFLConfig().clustering_assignment_mode, "distributed")
         self.assertEqual(NewFLConfig().client_test_partition_mode, "global_balanced")
         self.assertFalse(NewFLConfig().enable_cluster_personalized_evaluation)
+
+    def test_global_sync_interval_finishes_each_window_and_final_round(self):
+        self.assertEqual(
+            [r for r in range(10) if global_sync_due(r, 10, 3)],
+            [2, 5, 8, 9],
+        )
+        self.assertTrue(all(global_sync_due(r, 4, 1) for r in range(4)))
 
     def test_cluster_jsd_uses_natural_log_and_pairwise_mean(self):
         runtime = NewFLRuntime(NewFLConfig(use_gpu=False, num_clients=3))

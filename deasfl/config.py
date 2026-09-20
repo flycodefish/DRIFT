@@ -102,6 +102,7 @@ class NewFLConfig:
     cluster_trigger_factor: float = 0.05    # 聚类触发时间因子
     distribution_similarity_threshold: float = 0.0  # 分布感知聚类JSD阈值（0=禁用，0.3=中等相似度）
     intra_cluster_rounds: int = 1       # 每次全局聚合前的簇内训练-聚合轮数（1=原协议）
+    global_sync_interval: int = 1       # 每多少个训练周期执行全局聚合（1=原协议）
     enable_cluster_diagnostics: bool = False  # 独立记录簇模型指标；默认关闭，不影响正式路径
     cluster_diagnostics_interval: int = 1     # 每隔多少轮评价一次簇模型
     cluster_diagnostics_global_test: bool = True  # 同时评价簇模型在完整全局测试集上的表现

@@ -43,6 +43,7 @@ def _args(tmp_path: Path, methods: str = "fedavg,drift") -> Namespace:
         rounds=1,
         local_epochs=2,
         intra_cluster_rounds=1,
+        global_sync_interval=1,
         batch_size=32,
         learning_rate=0.001,
         partition="dirichlet",
@@ -135,6 +136,20 @@ def test_intra_cluster_rounds_only_apply_to_drift_variants(tmp_path: Path) -> No
     assert configs["drift"]["intra_cluster_rounds"] == 3
     assert configs["drift_data_aware"]["intra_cluster_rounds"] == 3
     assert plans[0]["contract"]["intra_cluster_rounds"] == 3
+
+
+def test_global_sync_interval_only_applies_to_drift_variants(tmp_path: Path) -> None:
+    args = _args(tmp_path, methods="fedavg,drift,drift_data_aware")
+    args.global_sync_interval = 5
+    plans = matrix.prepare_plan(args)
+    configs = {
+        item["method"]: matrix._read_yaml(Path(item["config"]))
+        for item in plans[0]["methods"]
+    }
+    assert "global_sync_interval" not in configs["fedavg"]
+    assert configs["drift"]["global_sync_interval"] == 5
+    assert configs["drift_data_aware"]["global_sync_interval"] == 5
+    assert plans[0]["contract"]["global_sync_interval"] == 5
 
 
 def test_oracle_methods_are_explicit_experiment_only_configs(tmp_path: Path) -> None:
