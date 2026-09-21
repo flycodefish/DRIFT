@@ -73,6 +73,14 @@ class FLConfig:
     neighbor_k: int = 2
     fixed_hierarchical_root_id: int = 0
     fixed_hierarchical_num_clusters: int = 2
+    # FedUC independent-reproduction baseline. Disabled unless the dedicated
+    # launcher is selected; these fields do not affect existing algorithms.
+    feduc_num_aggregators: int = 0  # 0 requires an explicit resolved value
+    feduc_global_sync_interval: int = 5
+    feduc_deadline_slack: float = 1.25
+    feduc_objective_mode: str = "unavailable"  # unavailable | label_distribution_proxy
+    feduc_aggregator_ids: str = ""  # optional comma-separated frozen ids
+    feduc_reference_train_ms_per_sample_epoch: float = 0.14610237849410623
     program_name: str = "fedavg"
     algorithm: str = "fedavg"  # fedavg | gossip | fedprox | dtd
     proximal_mu: float = 0.0  # FedProx proximal term strength (0 = disabled)

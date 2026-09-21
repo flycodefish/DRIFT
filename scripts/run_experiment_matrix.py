@@ -100,6 +100,11 @@ METHODS: dict[str, dict[str, Any]] = {
         "launcher": "scripts/run_epidemic_learning.py",
         "kind": "config_only",
     },
+    "feduc_inspired_censyn_i5": {
+        "templates": {"cifar10": "config_feduc_censyn.yaml"},
+        "launcher": "scripts/run_feduc.py",
+        "kind": "config_only",
+    },
     "drift": {
         "templates": {"har": "config_de_asfl_har_alignment_smoke.yaml", "cifar10": "config_de_asfl.yaml"},
         "launcher": "scripts/test_30_clients.py",
@@ -265,7 +270,7 @@ def _common_overrides(args: argparse.Namespace, seed: int) -> dict[str, Any]:
 
 def _contract(args: argparse.Namespace, methods: list[str]) -> dict[str, Any]:
     model, input_dim, num_classes = _resolved_model_settings(args)
-    return {
+    contract = {
         "dataset": args.dataset,
         "data_dir": str(Path(args.data_dir).resolve()),
         "template_dir": str(Path(args.template_dir).resolve()),
@@ -288,6 +293,15 @@ def _contract(args: argparse.Namespace, methods: list[str]) -> dict[str, Any]:
         "scenario_spec_hash": _digest(_scenario_spec(args)),
         **_effective_training(args),
     }
+    if "feduc_inspired_censyn_i5" in methods:
+        contract.update({
+            "feduc_aggregator_counts": getattr(args, "feduc_aggregator_counts", ""),
+            "feduc_deadline_slack": float(
+                getattr(args, "feduc_deadline_slack", 1.25)
+            ),
+            "feduc_objective_mode": "label_distribution_proxy",
+        })
+    return contract
 
 
 def _scenario_spec(args: argparse.Namespace) -> dict[str, Any]:
@@ -303,6 +317,23 @@ def _scenario_spec(args: argparse.Namespace) -> dict[str, Any]:
 def _digest(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _seed_int_mapping(value: str) -> dict[int, int]:
+    """Parse a deterministic comma-separated seed:value mapping."""
+    result: dict[int, int] = {}
+    if not str(value).strip():
+        return result
+    for raw in str(value).split(","):
+        try:
+            seed_text, count_text = raw.split(":", 1)
+            seed, count = int(seed_text), int(count_text)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid seed mapping entry: {raw!r}") from exc
+        if seed in result or count <= 0:
+            raise ValueError(f"Invalid seed mapping entry: {raw!r}")
+        result[seed] = count
+    return result
 
 
 def _file_hashes(root: Path, names: tuple[str, ...] = FROZEN_INPUT_FILES) -> dict[str, str]:
@@ -341,6 +372,9 @@ def _canonical_config_value(config: dict[str, Any], key: str) -> Any:
 def _apply_common(config: dict[str, Any], args: argparse.Namespace, seed: int,
                   frozen_dir: Path, method: str, output_dir: Path) -> dict[str, Any]:
     config.update(_common_overrides(args, seed))
+    # These evaluation controls belong to NewFLConfig/DRIFT only. Legacy
+    # FLConfig launchers, including the isolated FedUC baseline, must not
+    # receive them.
     if method in METHODS and METHODS[method]["kind"] != "drift":
         config.pop("client_test_partition_mode", None)
         config.pop("enable_cluster_personalized_evaluation", None)
@@ -412,6 +446,25 @@ def prepare_plan(args: argparse.Namespace) -> list[dict[str, Any]]:
             _apply_common(config, args, seed, frozen_dir, method, method_root)
             if method == "dynamic_dpsgd":
                 config["algorithm"] = "dynamic_dpsgd"
+            if method == "feduc_inspired_censyn_i5":
+                counts = _seed_int_mapping(
+                    getattr(args, "feduc_aggregator_counts", "")
+                )
+                if seed not in counts:
+                    raise ValueError(
+                        "feduc_inspired_censyn_i5 requires an explicit "
+                        f"aggregator count for seed {seed} via "
+                        "--feduc-aggregator-counts"
+                    )
+                config.update({
+                    "algorithm": "feduc_inspired_censyn",
+                    "feduc_num_aggregators": counts[seed],
+                    "feduc_global_sync_interval": 5,
+                    "feduc_deadline_slack": float(
+                        getattr(args, "feduc_deadline_slack", 1.25)
+                    ),
+                    "feduc_objective_mode": "label_distribution_proxy",
+                })
             if method == "drift_no_resource_awareness":
                 config["resource_awareness"] = False
             if method in {
@@ -1023,6 +1076,11 @@ def main() -> None:
     )
     parser.add_argument("--drift-jsd-threshold", type=float, default=0.2,
                         help="JSD acceptance threshold for drift_data_aware")
+    parser.add_argument(
+        "--feduc-aggregator-counts", default="",
+        help="Explicit seed:count map for FedUC-inspired, e.g. 42:9,43:3,44:8",
+    )
+    parser.add_argument("--feduc-deadline-slack", type=float, default=1.25)
     parser.add_argument("--cluster-diagnostics-interval", type=int, default=1)
     parser.add_argument("--enable-cluster-diagnostics", action="store_true",
                         help="Record identical cluster diagnostics for the base drift control")
@@ -1052,6 +1110,8 @@ def main() -> None:
         raise ValueError("--intra-cluster-rounds must be positive")
     if args.global_sync_interval <= 0:
         raise ValueError("--global-sync-interval must be positive")
+    if args.feduc_deadline_slack < 1.0:
+        raise ValueError("--feduc-deadline-slack must be at least 1.0")
     if args.run_smoke and args.rounds > 3 and not args.allow_long:
         raise ValueError("--run-smoke above 3 rounds requires --allow-long")
     if args.status:

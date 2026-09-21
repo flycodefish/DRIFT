@@ -121,7 +121,26 @@ def test_default_methods_keep_dynamic_dpsgd_opt_in() -> None:
         "drift_random_matched", "drift_oracle_data_similar",
         "drift_jsd_q00", "drift_jsd_q25", "drift_jsd_q50",
         "drift_jsd_q75", "drift_jsd_q100",
+        "feduc_inspired_censyn_i5",
     }
+
+
+def test_feduc_inspired_is_opt_in_and_requires_seed_counts(tmp_path: Path) -> None:
+    args = _args(tmp_path, methods="feduc_inspired_censyn_i5")
+    args.dataset = "cifar10"
+    args.template_dir = str(matrix.REPO_ROOT / "configs/cifar10")
+    args.feduc_aggregator_counts = "42:9,43:3"
+    args.feduc_deadline_slack = 1.25
+    plans = matrix.prepare_plan(args)
+    method = plans[0]["methods"][0]
+    resolved = matrix._read_yaml(Path(method["config"]))
+    assert method["command"][1] == "scripts/run_feduc.py"
+    assert resolved["algorithm"] == "feduc_inspired_censyn"
+    assert resolved["feduc_num_aggregators"] == 9
+    assert resolved["feduc_global_sync_interval"] == 5
+    assert resolved["feduc_objective_mode"] == "label_distribution_proxy"
+    assert "client_test_partition_mode" not in resolved
+    assert "enable_cluster_personalized_evaluation" not in resolved
 
 
 def test_intra_cluster_rounds_only_apply_to_drift_variants(tmp_path: Path) -> None:
